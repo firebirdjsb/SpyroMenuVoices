@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(SpyroMenuVoices VERSION 0.2.0 LANGUAGES CXX RC)
+project(SpyroMenuVoices VERSION 0.3.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "SpyroMenuVoices requires Windows x64 and MSVC.")
@@ -13,6 +13,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_library(SpyroMenuVoices SHARED
   src/audio_engine.cpp
   src/dllmain.cpp
+  src/menu_event_hook.cpp
   src/resources.rc
 )
 target_include_directories(SpyroMenuVoices PRIVATE include src)
