@@ -1,16 +1,45 @@
 # Spyro Menu Voices
 
-Native x64 audio resource module for Spyro Reignited Trilogy. It embeds the restored title and game-selection voice clips and exposes a small cue API for another ASI, such as Spyro Workshop or a title-menu hook, to call.
+Native x64 ASI that restores the scrapped title and game-selection voice lines in Spyro Reignited Trilogy.
 
-## Important: the module needs a caller
+## Reference behavior
 
-`SpyroMenuVoices.asi` is an audio provider, not a title-menu detector. Loading it by itself does not know when the Reignited title or one of the three game buttons becomes selected. The caller must resolve and invoke `SpyroMenuVoices_PlayCue` at the actual UI focus/activation event.
+The native menu hook is designed to match the supplied working reference recording:
 
-The module now writes `SpyroMenuVoices.log` beside the ASI. A successful startup contains `ready ... clips=4`, and each accepted cue contains `cue=N started`. If no cue lines appear, the title-menu caller is missing or is firing the event too late.
+- Play **“Spyro Reignited Trilogy”** as the trilogy title screen appears.
+- Play the currently active game name immediately when the three-game chooser opens.
+- Play Spyro 1, Spyro 2, or Spyro 3 immediately when that game becomes active through mouse hover, keyboard, or controller navigation.
+- Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
+- The embedded WAV is played at its original full level with no added fade or artificial delay.
+
+The ASI listens to Falcon's native `SetActiveGameIndex` event. Game indices map as `0 = Spyro 1`, `1 = Spyro 2`, and `2 = Spyro 3`; the invalid/root index maps to the Reignited Trilogy title line. The hook is installed on the Falcon blueprint-library default object instead of detouring global `ProcessEvent`, so it can coexist with other ASIs that hook `ProcessEvent`.
 
 ## Install
 
-Copy `SpyroMenuVoices.asi` beside `Spyro-Win64-Shipping.exe` in `Falcon\Binaries\Win64`, together with the ASI that detects the title/game-selection UI events and calls this module.
+Copy `SpyroMenuVoices.asi` beside:
+
+```text
+Falcon\Binaries\Win64\Spyro-Win64-Shipping.exe
+```
+
+No loose WAV files are required. All four supplied clips are embedded in the ASI.
+
+## Diagnostics
+
+`SpyroMenuVoices.log` is created beside the ASI. A healthy startup should include:
+
+```text
+ready channels=2 rate=48000 bits=16 clips=4
+[MenuEvents] found function=SetActiveGameIndex ...
+[MenuEvents] installed per-object ProcessEvent bridge ...
+```
+
+Each menu event should then show the native game index and selected cue:
+
+```text
+[MenuEvents] SetActiveGameIndex index=2 -> cue=3
+cue=3 started ...
+```
 
 ## Build
 
@@ -21,19 +50,8 @@ cmake --build build --config Release --parallel
 
 The output is `build\Release\SpyroMenuVoices.asi`.
 
-## Cue API
+## Exported API
 
-```cpp
-using PlayCue = bool(__cdecl*)(int cue) noexcept;
-using GetState = int(__cdecl*)() noexcept;
-```
-
-Exports:
-
-- `SpyroMenuVoices_PlayCue(0)` — “Spyro Reignited Trilogy”
-- `SpyroMenuVoices_PlayCue(1)` — “Spyro the Dragon”
-- `SpyroMenuVoices_PlayCue(2)` — “Spyro 2: Ripto's Rage”
-- `SpyroMenuVoices_PlayCue(3)` — “Spyro: Year of the Dragon”
-- `SpyroMenuVoices_GetState()` — `0` not started, `1` initializing, `2` ready, `3` fallback-only/failed
-
-Playback uses a preloaded, dedicated WinMM `waveOut` device rather than process-global `PlaySound`. New cues interrupt the previous cue immediately, and only duplicate events within 150 ms are ignored.
+- `SpyroMenuVoices_PlayCue(int cue)`
+- `SpyroMenuVoices_GetState()`
+- `SpyroMenuVoices_GetHookState()`
