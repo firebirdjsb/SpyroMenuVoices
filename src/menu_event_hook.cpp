@@ -327,12 +327,12 @@ bool FindGameIndexFunctions() noexcept {
         Log("INFO", message);
     }
 
-    if (context.targetSetGameIndex) {
+    if (context.targetGetGameIndex) {
         return true;
     }
 
     if (!candidates.empty()) {
-        std::string message = "SetGameIndex not ready; candidates=";
+        std::string message = "GetGameIndex not ready; candidates=";
         for (const auto& candidate : candidates) {
             if (message.size() > 1500) break;
             message += candidate;
@@ -393,11 +393,8 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
             gameIndex >= 0 && gameIndex <= 2 ? " -> voice" : "");
         Log("INFO", message);
 
-        if (gameIndex >= 0 && gameIndex <= 2) {
-            voice_audio::Play(CueForGameIndex(gameIndex));
-        }
-
-        // Start the line before the original UI handler so menu work cannot add latency.
+        // Runtime tracing proved neither setter drives trilogy hover/navigation.
+        // Keep these diagnostics, but never trigger menu voice audio from setters.
         next(self, function, parameters);
         return;
     }
@@ -408,21 +405,60 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         if (!IsReadable(parameters, sizeof(SetActiveGameIndexParams))) return;
         const auto* params = static_cast<const SetActiveGameIndexParams*>(parameters);
         const int value = params->index;
-        std::atomic<int>& previous = isGetActive
-            ? context.lastGetActiveGameIndex
-            : context.lastGetGameIndex;
-        const int old = previous.exchange(value, std::memory_order_relaxed);
-        if (old != value) {
-            char message[192]{};
+
+        if (isGetActive) {
+            const int old = context.lastGetActiveGameIndex.exchange(value, std::memory_order_relaxed);
+            if (old != value) {
+                char message[192]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "GetActiveGameIndex changed %d -> %d",
+                    old,
+                    value);
+                Log("INFO", message);
+            }
+            return;
+        }
+
+        const int old = context.lastGetGameIndex.exchange(value, std::memory_order_relaxed);
+        if (old == value) return;
+
+        if (old == -999) {
+            char message[224]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "%s changed %d -> %d",
-                isGetActive ? "GetActiveGameIndex" : "GetGameIndex",
-                old,
+                "GetGameIndex initial=%d -> trilogy title cue=0",
                 value);
             Log("INFO", message);
+            voice_audio::Play(0);
+            return;
         }
+
+        if (value >= 0 && value <= 2) {
+            const int cue = CueForGameIndex(value);
+            char message[224]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "GetGameIndex selection %d -> %d -> cue=%d",
+                old,
+                value,
+                cue);
+            Log("INFO", message);
+            voice_audio::Play(cue);
+            return;
+        }
+
+        char message[192]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "GetGameIndex changed %d -> %d (ignored)",
+            old,
+            value);
+        Log("INFO", message);
         return;
     }
 
@@ -498,7 +534,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon game-index setters/getters before installing global ProcessEvent tracer");
+    Log("INFO", "searching for Falcon GetGameIndex menu-selection signal");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -513,7 +549,7 @@ bool Install(HMODULE module) noexcept {
         Sleep(kSearchDelayMs);
     }
 
-    Log("ERROR", "timed out locating SetGameIndex or hooking global ProcessEvent");
+    Log("ERROR", "timed out locating GetGameIndex or hooking global ProcessEvent");
     context.state.store(HookState::Failed);
     return false;
 }

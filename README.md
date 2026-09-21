@@ -12,7 +12,7 @@ The native menu hook is designed to match the supplied working reference recordi
 - Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
 - The embedded WAV is played at its original full level with no added fade or artificial delay.
 
-The ASI listens to Falcon's native `SetActiveGameIndex` event. Game indices map as `0 = Spyro 1`, `1 = Spyro 2`, and `2 = Spyro 3`; the invalid/root index maps to the Reignited Trilogy title line. The hook is installed on the Falcon blueprint-library default object instead of detouring global `ProcessEvent`, so it can coexist with other ASIs that hook `ProcessEvent`.
+Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. The reliable signal is FalconGameplayStatics `GetGameIndex`: its returned value changes in exact lockstep with the highlighted trilogy tile. The first observed `GetGameIndex` result triggers the Reignited Trilogy title line; later changes map `0 = Spyro 1`, `1 = Spyro 2`, and `2 = Spyro 3`. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
 
 ## Install
 
@@ -30,15 +30,19 @@ No loose WAV files are required. All four supplied clips are embedded in the ASI
 
 ```text
 ready channels=2 rate=48000 bits=16 clips=4
-[MenuEvents] found function=SetActiveGameIndex ...
-[MenuEvents] installed per-object ProcessEvent bridge ...
+[MenuEvents] tracking function=GetGameIndex outer=FalconGameplayStatics ...
+[MenuEvents] installed global ProcessEvent hook ...
 ```
 
-Each menu event should then show the native game index and selected cue:
+The first observed game index announces the trilogy title, then highlighted-tile changes announce the selected game:
 
 ```text
-[MenuEvents] SetActiveGameIndex index=2 -> cue=3
+[MenuEvents] GetGameIndex initial=0 -> trilogy title cue=0
+cue=0 started ...
+[MenuEvents] GetGameIndex selection 0 -> 2 -> cue=3
 cue=3 started ...
+[MenuEvents] GetGameIndex selection 2 -> 1 -> cue=2
+cue=2 started ...
 ```
 
 ## Build
