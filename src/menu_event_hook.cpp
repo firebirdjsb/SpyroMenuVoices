@@ -33,6 +33,16 @@ constexpr std::size_t kVtableSlotsToClone = 128;
 constexpr int kSearchAttempts = 120;
 constexpr DWORD kSearchDelayMs = 250;
 
+// GetGameIndex is polled rapidly while the trilogy game chooser is actually visible.
+// Sparse calls during profile/save loading are not treated as menu visibility.
+constexpr ULONGLONG kSelectorRapidCallMaxGapMs = 120;
+constexpr int kSelectorEnterRapidSamples = 4;
+constexpr ULONGLONG kSelectorExitSilenceMs = 280;
+constexpr ULONGLONG kStartupSparseGapMs = 500;
+constexpr int kStartupRootCandidateSamples = 2;
+constexpr ULONGLONG kStartupRootDelayMs = 280;
+constexpr DWORD kMenuStateWatchdogSleepMs = 25;
+
 enum class HookState : int {
     NotStarted = 0,
     Searching = 1,
@@ -91,6 +101,14 @@ struct HookContext {
     ProcessEventFn nextProcessEvent{};
     std::atomic<int> lastGetActiveGameIndex{-999};
     std::atomic<int> lastGetGameIndex{-999};
+    std::atomic<int> latestGameIndex{-999};
+    std::atomic<ULONGLONG> lastGetGameCallTick{0};
+    std::atomic<int> rapidGetGameSamples{0};
+    std::atomic<int> startupSparseSamples{0};
+    std::atomic<ULONGLONG> startupRootCueDueTick{0};
+    std::atomic<bool> selectorActive{false};
+    std::atomic<bool> selectorEverActive{false};
+    std::atomic<bool> watchdogStarted{false};
     std::wstring logPath;
     std::mutex logMutex;
     std::atomic<HookState> state{HookState::NotStarted};
@@ -348,6 +366,166 @@ int CueForGameIndex(std::int32_t index) noexcept {
     return 0;
 }
 
+void PlaySelectorEntryCue(int gameIndex) noexcept {
+    if (gameIndex < 0 || gameIndex > 2) return;
+    const int cue = CueForGameIndex(gameIndex);
+    char message[224]{};
+    std::snprintf(
+        message,
+        sizeof(message),
+        "selector entered gameIndex=%d -> cue=%d",
+        gameIndex,
+        cue);
+    Log("INFO", message);
+    voice_audio::Play(cue);
+}
+
+void EnterSelectorIfReady(int currentGameIndex, int rapidSamples) noexcept {
+    auto& context = Context();
+    if (rapidSamples < kSelectorEnterRapidSamples) return;
+
+    bool expected = false;
+    if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
+
+    context.selectorEverActive.store(true, std::memory_order_release);
+    context.startupRootCueDueTick.store(0, std::memory_order_release);
+    PlaySelectorEntryCue(currentGameIndex);
+}
+
+void ObserveGetGameIndex(int value) noexcept {
+    auto& context = Context();
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG previousCall =
+        context.lastGetGameCallTick.exchange(now, std::memory_order_acq_rel);
+
+    context.latestGameIndex.store(value, std::memory_order_release);
+    const int oldValue =
+        context.lastGetGameIndex.exchange(value, std::memory_order_acq_rel);
+
+    ULONGLONG gap = 0;
+    int rapidSamples = 1;
+
+    if (previousCall != 0 && now >= previousCall) {
+        gap = now - previousCall;
+        if (gap <= kSelectorRapidCallMaxGapMs) {
+            rapidSamples =
+                context.rapidGetGameSamples.fetch_add(1, std::memory_order_acq_rel) + 1;
+        } else {
+            context.rapidGetGameSamples.store(1, std::memory_order_release);
+        }
+    } else {
+        context.rapidGetGameSamples.store(1, std::memory_order_release);
+    }
+
+    if (!context.selectorEverActive.load(std::memory_order_acquire)) {
+        if (previousCall == 0) {
+            context.startupSparseSamples.store(1, std::memory_order_release);
+            Log("INFO", "startup GetGameIndex sample observed; audio suppressed until menu state is known");
+        } else if (gap >= kStartupSparseGapMs) {
+            const int sparseSamples =
+                context.startupSparseSamples.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (sparseSamples >= kStartupRootCandidateSamples) {
+                context.startupRootCueDueTick.store(
+                    now + kStartupRootDelayMs,
+                    std::memory_order_release);
+                char message[224]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "startup/root candidate armed after sparse GetGameIndex gap=%llu ms",
+                    static_cast<unsigned long long>(gap));
+                Log("INFO", message);
+            }
+        }
+    }
+
+    if (!context.selectorActive.load(std::memory_order_acquire)) {
+        EnterSelectorIfReady(value, rapidSamples);
+        return;
+    }
+
+    if (oldValue != value && value >= 0 && value <= 2) {
+        const int cue = CueForGameIndex(value);
+        char message[224]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "selector highlight %d -> %d -> cue=%d",
+            oldValue,
+            value,
+            cue);
+        Log("INFO", message);
+        voice_audio::Play(cue);
+    }
+}
+
+DWORD WINAPI MenuStateWatchdog(void*) noexcept {
+    auto& context = Context();
+
+    for (;;) {
+        if (context.state.load(std::memory_order_acquire) == HookState::Failed) {
+            return 0;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG lastCall =
+            context.lastGetGameCallTick.load(std::memory_order_acquire);
+
+        if (context.selectorActive.load(std::memory_order_acquire)) {
+            if (lastCall != 0 && now >= lastCall &&
+                now - lastCall >= kSelectorExitSilenceMs) {
+                bool expected = true;
+                if (context.selectorActive.compare_exchange_strong(expected, false)) {
+                    context.rapidGetGameSamples.store(0, std::memory_order_release);
+                    context.startupRootCueDueTick.store(0, std::memory_order_release);
+                    Log("INFO", "selector exited -> root menu trilogy title cue=0");
+                    voice_audio::Play(0);
+                }
+            }
+        } else if (!context.selectorEverActive.load(std::memory_order_acquire)) {
+            const ULONGLONG due =
+                context.startupRootCueDueTick.load(std::memory_order_acquire);
+            if (due != 0 && now >= due) {
+                ULONGLONG expectedDue = due;
+                if (context.startupRootCueDueTick.compare_exchange_strong(
+                        expectedDue,
+                        0,
+                        std::memory_order_acq_rel)) {
+                    Log("INFO", "startup/profile stage ended -> root menu trilogy title cue=0");
+                    voice_audio::Play(0);
+                }
+            }
+        }
+
+        Sleep(kMenuStateWatchdogSleepMs);
+    }
+}
+
+bool StartMenuStateWatchdog() noexcept {
+    auto& context = Context();
+    bool expected = false;
+    if (!context.watchdogStarted.compare_exchange_strong(expected, true)) {
+        return true;
+    }
+
+    HANDLE thread = CreateThread(
+        nullptr,
+        0,
+        &MenuStateWatchdog,
+        nullptr,
+        0,
+        nullptr);
+    if (!thread) {
+        context.watchdogStarted.store(false, std::memory_order_release);
+        Log("ERROR", "failed to create menu-state watchdog thread");
+        return false;
+    }
+
+    CloseHandle(thread);
+    Log("INFO", "menu-state watchdog started");
+    return true;
+}
+
 void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) noexcept {
     auto& context = Context();
     const ProcessEventFn next = context.nextProcessEvent;
@@ -421,44 +599,7 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
             return;
         }
 
-        const int old = context.lastGetGameIndex.exchange(value, std::memory_order_relaxed);
-        if (old == value) return;
-
-        if (old == -999) {
-            char message[224]{};
-            std::snprintf(
-                message,
-                sizeof(message),
-                "GetGameIndex initial=%d -> trilogy title cue=0",
-                value);
-            Log("INFO", message);
-            voice_audio::Play(0);
-            return;
-        }
-
-        if (value >= 0 && value <= 2) {
-            const int cue = CueForGameIndex(value);
-            char message[224]{};
-            std::snprintf(
-                message,
-                sizeof(message),
-                "GetGameIndex selection %d -> %d -> cue=%d",
-                old,
-                value,
-                cue);
-            Log("INFO", message);
-            voice_audio::Play(cue);
-            return;
-        }
-
-        char message[192]{};
-        std::snprintf(
-            message,
-            sizeof(message),
-            "GetGameIndex changed %d -> %d (ignored)",
-            old,
-            value);
-        Log("INFO", message);
+        ObserveGetGameIndex(value);
         return;
     }
 
@@ -534,7 +675,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon GetGameIndex menu-selection signal");
+    Log("INFO", "searching for Falcon GetGameIndex menu-selection signal with visibility gating");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -543,7 +684,11 @@ bool Install(HMODULE module) noexcept {
 
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
         if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
-            context.state.store(HookState::Installed);
+            context.state.store(HookState::Installed, std::memory_order_release);
+            if (!StartMenuStateWatchdog()) {
+                context.state.store(HookState::Failed, std::memory_order_release);
+                return false;
+            }
             return true;
         }
         Sleep(kSearchDelayMs);
