@@ -186,6 +186,20 @@ std::string Normalize(std::string_view value) {
     return normalized;
 }
 
+bool AppendNameGuarded(AppendStringFn appendString, const FNameRaw* name, FStringRaw* output) noexcept {
+#if defined(_MSC_VER)
+    __try {
+#endif
+        if (!appendString || !name || !output) return false;
+        appendString(name, *output);
+        return true;
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
 std::string ObjectName(void* object) noexcept {
     auto& context = Context();
     if (!context.appendString || !IsReadable(object, kUObjectNameOffset + sizeof(FNameRaw))) return {};
@@ -195,15 +209,7 @@ std::string ObjectName(void* object) noexcept {
     const auto* name = reinterpret_cast<const FNameRaw*>(
         static_cast<const std::uint8_t*>(object) + kUObjectNameOffset);
 
-#if defined(_MSC_VER)
-    __try {
-#endif
-        context.appendString(name, string);
-#if defined(_MSC_VER)
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return {};
-    }
-#endif
+    if (!AppendNameGuarded(context.appendString, name, &string)) return {};
 
     if (string.data != buffer.data() || string.num <= 0 || string.num > static_cast<std::int32_t>(buffer.size())) return {};
     const int sourceLength = string.data[string.num - 1] == L'\0' ? string.num - 1 : string.num;
@@ -324,8 +330,6 @@ bool FindSetActiveGameIndex() noexcept {
 
 int CueForGameIndex(std::int32_t index) noexcept {
     if (index >= 0 && index <= 2) return index + 1;
-    // The trilogy title/front-end uses the invalid active-game state when the
-    // player backs out of the three-game chooser.
     return 0;
 }
 
