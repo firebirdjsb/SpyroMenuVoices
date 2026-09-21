@@ -1,0 +1,5 @@
+#pragma once
+#define IDR_VOICE_REIGNITED 101
+#define IDR_VOICE_SPYRO1    102
+#define IDR_VOICE_SPYRO2    103
+#define IDR_VOICE_SPYRO3    104

@@ -1,0 +1,6 @@
+#include "resource.h"
+
+IDR_VOICE_REIGNITED WAVE "../assets/spyro_vo_reignited.wav"
+IDR_VOICE_SPYRO1    WAVE "../assets/spyro_vo_spyro1.wav"
+IDR_VOICE_SPYRO2    WAVE "../assets/spyro_vo_spyro2_US.wav"
+IDR_VOICE_SPYRO3    WAVE "../assets/spyro_vo_spyro3.wav"
