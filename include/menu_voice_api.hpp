@@ -1,10 +1,12 @@
 #pragma once
-#include <cstdint>
 
 namespace menu_voice_api {
-using Address=std::uintptr_t;
-using Event=void(__cdecl*)(Address imageBase,Address object,Address function,
-    void* parameters) noexcept;
-// 0=Reignited title, 1=Spyro 1, 2=Spyro 2, 3=Spyro 3.
-using PlayCue=bool(__cdecl*)(int cue) noexcept;
-}
+
+// 0 = Reignited Trilogy title, 1 = Spyro the Dragon,
+// 2 = Spyro 2: Ripto's Rage, 3 = Spyro: Year of the Dragon.
+using PlayCue = bool(__cdecl*)(int cue) noexcept;
+
+// 0 = not started, 1 = initializing, 2 = ready, 3 = fallback-only/failed.
+using GetState = int(__cdecl*)() noexcept;
+
+} // namespace menu_voice_api
