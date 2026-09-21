@@ -84,12 +84,13 @@ struct HookContext {
     std::uintptr_t imageBase{};
     TUObjectArrayRaw* objects{};
     AppendStringFn appendString{};
-    void* targetFunction{};
-    void* targetClass{};
-    void* targetDefaultObject{};
-    void** originalVtable{};
-    void** clonedVtable{};
+    void* targetSetActiveGameIndex{};
+    void* targetSetGameIndex{};
+    void* targetGetActiveGameIndex{};
+    void* targetGetGameIndex{};
     ProcessEventFn nextProcessEvent{};
+    std::atomic<int> lastGetActiveGameIndex{-999};
+    std::atomic<int> lastGetGameIndex{-999};
     std::wstring logPath;
     std::mutex logMutex;
     std::atomic<HookState> state{HookState::NotStarted};
@@ -275,51 +276,63 @@ bool ObjectArrayReady() noexcept {
     return IsReadable(snapshot.objects, static_cast<std::size_t>(snapshot.numElements) * sizeof(FUObjectItemRaw));
 }
 
-bool FindSetActiveGameIndex() noexcept {
+bool FindGameIndexFunctions() noexcept {
     auto& context = Context();
     if (!ObjectArrayReady()) return false;
 
     const auto snapshot = *context.objects;
     std::vector<std::string> candidates;
-    candidates.reserve(16);
+    candidates.reserve(24);
 
     for (std::int32_t index = 0; index < snapshot.numElements; ++index) {
         void* object = snapshot.objects[index].object;
         if (!object) continue;
+
         const std::string name = ObjectName(object);
         if (name.empty()) continue;
         const std::string normalized = Normalize(name);
-        if (normalized.find("gameindex") != std::string::npos && candidates.size() < 16) {
+
+        if (normalized.find("gameindex") != std::string::npos && candidates.size() < 24) {
             candidates.push_back(name);
         }
-        if (normalized != "setactivegameindex") continue;
 
-        if (!IsReadable(object, kUObjectOuterOffset + sizeof(void*))) continue;
-        void* outer = *reinterpret_cast<void**>(static_cast<std::uint8_t*>(object) + kUObjectOuterOffset);
-        if (!IsReadable(outer, kUClassDefaultObjectOffset + sizeof(void*))) continue;
-        void* defaultObject = *reinterpret_cast<void**>(static_cast<std::uint8_t*>(outer) + kUClassDefaultObjectOffset);
-        if (!IsReadable(defaultObject, sizeof(void*))) continue;
+        void** targetSlot = nullptr;
+        if (normalized == "setactivegameindex") targetSlot = &context.targetSetActiveGameIndex;
+        else if (normalized == "setgameindex") targetSlot = &context.targetSetGameIndex;
+        else if (normalized == "getactivegameindex") targetSlot = &context.targetGetActiveGameIndex;
+        else if (normalized == "getgameindex") targetSlot = &context.targetGetGameIndex;
+        else continue;
 
-        context.targetFunction = object;
-        context.targetClass = outer;
-        context.targetDefaultObject = defaultObject;
+        if (*targetSlot) continue;
+        *targetSlot = object;
 
-        const std::string outerName = ObjectName(outer);
+        std::string outerName = "<unknown>";
+        if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
+            void* outer = *reinterpret_cast<void**>(
+                static_cast<std::uint8_t*>(object) + kUObjectOuterOffset);
+            if (outer) {
+                const std::string resolvedOuter = ObjectName(outer);
+                if (!resolvedOuter.empty()) outerName = resolvedOuter;
+            }
+        }
+
         char message[512]{};
         std::snprintf(
             message,
             sizeof(message),
-            "found function=%s outer=%s function=%p defaultObject=%p",
+            "tracking function=%s outer=%s function=%p",
             name.c_str(),
-            outerName.empty() ? "<unknown>" : outerName.c_str(),
-            object,
-            defaultObject);
+            outerName.c_str(),
+            object);
         Log("INFO", message);
+    }
+
+    if (context.targetSetGameIndex) {
         return true;
     }
 
     if (!candidates.empty()) {
-        std::string message = "SetActiveGameIndex not found; candidates=";
+        std::string message = "SetGameIndex not ready; candidates=";
         for (const auto& candidate : candidates) {
             if (message.size() > 1500) break;
             message += candidate;
@@ -340,18 +353,77 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const ProcessEventFn next = context.nextProcessEvent;
     if (!next) return;
 
-    const bool isSelectionEvent = function == context.targetFunction;
-    std::int32_t gameIndex = -999;
-    if (isSelectionEvent && IsReadable(parameters, sizeof(SetActiveGameIndexParams))) {
-        gameIndex = static_cast<SetActiveGameIndexParams*>(parameters)->index;
+    const bool isSetActive = function == context.targetSetActiveGameIndex;
+    const bool isSetGame = function == context.targetSetGameIndex;
+    const bool isGetActive = function == context.targetGetActiveGameIndex;
+    const bool isGetGame = function == context.targetGetGameIndex;
+
+    if (isSetActive || isSetGame) {
+        std::int32_t raw0 = -999;
+        std::int32_t raw4 = -999;
+        std::int32_t raw8 = -999;
+        std::int32_t raw12 = -999;
+        if (IsReadable(parameters, 0x10)) {
+            const auto* bytes = static_cast<const std::uint8_t*>(parameters);
+            std::memcpy(&raw0, bytes + 0x0, sizeof(raw0));
+            std::memcpy(&raw4, bytes + 0x4, sizeof(raw4));
+            std::memcpy(&raw8, bytes + 0x8, sizeof(raw8));
+            std::memcpy(&raw12, bytes + 0xC, sizeof(raw12));
+        }
+
+        std::int32_t gameIndex = -999;
+        if (isSetGame) {
+            // UI/member setters commonly carry only the int at offset 0.
+            if (raw0 >= 0 && raw0 <= 2) gameIndex = raw0;
+            else if (raw8 >= 0 && raw8 <= 2) gameIndex = raw8;
+        } else {
+            // Verified FalconGameplayStatics layout: world context + int index.
+            if (raw8 >= 0 && raw8 <= 2) gameIndex = raw8;
+            else if (raw0 >= 0 && raw0 <= 2) gameIndex = raw0;
+        }
+
+        char message[320]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "%s raw=[%d,%d,%d,%d] resolvedIndex=%d%s",
+            isSetGame ? "SetGameIndex" : "SetActiveGameIndex",
+            raw0, raw4, raw8, raw12,
+            gameIndex,
+            gameIndex >= 0 && gameIndex <= 2 ? " -> voice" : "");
+        Log("INFO", message);
+
+        if (gameIndex >= 0 && gameIndex <= 2) {
+            voice_audio::Play(CueForGameIndex(gameIndex));
+        }
+
+        // Start the line before the original UI handler so menu work cannot add latency.
+        next(self, function, parameters);
+        return;
     }
 
-    if (isSelectionEvent && gameIndex != -999) {
-        const int cue = CueForGameIndex(gameIndex);
-        char message[192]{};
-        std::snprintf(message, sizeof(message), "SetActiveGameIndex index=%d -> cue=%d", gameIndex, cue);
-        Log("INFO", message);
-        voice_audio::Play(cue);
+    if (isGetActive || isGetGame) {
+        next(self, function, parameters);
+
+        if (!IsReadable(parameters, sizeof(SetActiveGameIndexParams))) return;
+        const auto* params = static_cast<const SetActiveGameIndexParams*>(parameters);
+        const int value = params->index;
+        std::atomic<int>& previous = isGetActive
+            ? context.lastGetActiveGameIndex
+            : context.lastGetGameIndex;
+        const int old = previous.exchange(value, std::memory_order_relaxed);
+        if (old != value) {
+            char message[192]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "%s changed %d -> %d",
+                isGetActive ? "GetActiveGameIndex" : "GetGameIndex",
+                old,
+                value);
+            Log("INFO", message);
+        }
+        return;
     }
 
     next(self, function, parameters);
@@ -403,10 +475,13 @@ bool InstallGlobalProcessEventHook() noexcept {
     std::snprintf(
         message,
         sizeof(message),
-        "installed global ProcessEvent hook target=%p trampoline=%p filterFunction=%p",
+        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p",
         target,
         trampoline,
-        context.targetFunction);
+        context.targetSetGameIndex,
+        context.targetSetActiveGameIndex,
+        context.targetGetActiveGameIndex,
+        context.targetGetGameIndex);
     Log("INFO", message);
     return true;
 }
@@ -423,7 +498,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for SetActiveGameIndex before installing global ProcessEvent filter");
+    Log("INFO", "searching for Falcon game-index setters/getters before installing global ProcessEvent tracer");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -431,14 +506,14 @@ bool Install(HMODULE module) noexcept {
     }
 
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
-        if (FindSetActiveGameIndex() && InstallGlobalProcessEventHook()) {
+        if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed);
             return true;
         }
         Sleep(kSearchDelayMs);
     }
 
-    Log("ERROR", "timed out locating or hooking SetActiveGameIndex");
+    Log("ERROR", "timed out locating SetGameIndex or hooking global ProcessEvent");
     context.state.store(HookState::Failed);
     return false;
 }
