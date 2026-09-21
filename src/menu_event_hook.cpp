@@ -2,6 +2,7 @@
 #include "audio_engine.hpp"
 
 #include <Windows.h>
+#include <MinHook.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@ namespace {
 
 constexpr std::uintptr_t kGObjectsOffset = 0x03562340;
 constexpr std::uintptr_t kAppendStringOffset = 0x005E4C60;
+constexpr std::uintptr_t kProcessEventOffset = 0x007688B0;
 constexpr std::uint32_t kExpectedTimestamp = 1558415778;
 constexpr std::uint32_t kExpectedImageSize = 61046784;
 constexpr std::size_t kUObjectNameOffset = 0x18;
@@ -344,53 +346,56 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         gameIndex = static_cast<SetActiveGameIndexParams*>(parameters)->index;
     }
 
-    next(self, function, parameters);
+    if (isSelectionEvent && gameIndex != -999) {
+        const int cue = CueForGameIndex(gameIndex);
+        char message[192]{};
+        std::snprintf(message, sizeof(message), "SetActiveGameIndex index=%d -> cue=%d", gameIndex, cue);
+        Log("INFO", message);
+        voice_audio::Play(cue);
+    }
 
-    if (!isSelectionEvent || gameIndex == -999) return;
-    const int cue = CueForGameIndex(gameIndex);
-    char message[192]{};
-    std::snprintf(message, sizeof(message), "SetActiveGameIndex index=%d -> cue=%d", gameIndex, cue);
-    Log("INFO", message);
-    voice_audio::Play(cue);
+    next(self, function, parameters);
 }
 
-bool InstallVtableBridge() noexcept {
+bool InstallGlobalProcessEventHook() noexcept {
     auto& context = Context();
-    if (!context.targetDefaultObject || !IsReadable(context.targetDefaultObject, sizeof(void*))) return false;
-
-    auto*** objectVtablePointer = reinterpret_cast<void***>(context.targetDefaultObject);
-    void** original = *objectVtablePointer;
-    if (!IsReadable(original, kVtableSlotsToClone * sizeof(void*))) {
-        Log("ERROR", "target default-object vtable is unreadable");
-        return false;
-    }
-    if (!IsExecutable(original[kProcessEventIndex])) {
-        Log("ERROR", "target ProcessEvent vtable slot is not executable");
+    void* target = reinterpret_cast<void*>(context.imageBase + kProcessEventOffset);
+    if (!IsExecutable(target)) {
+        Log("ERROR", "validated global ProcessEvent address is not executable");
         return false;
     }
 
-    auto** clone = static_cast<void**>(VirtualAlloc(
-        nullptr,
-        kVtableSlotsToClone * sizeof(void*),
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE));
-    if (!clone) {
-        Log("ERROR", "VirtualAlloc failed for cloned vtable");
+    const MH_STATUS initializeStatus = MH_Initialize();
+    if (initializeStatus != MH_OK && initializeStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "MH_Initialize failed status=%s", MH_StatusToString(initializeStatus));
+        Log("ERROR", message);
         return false;
     }
-    std::memcpy(clone, original, kVtableSlotsToClone * sizeof(void*));
 
-    context.originalVtable = original;
-    context.clonedVtable = clone;
-    context.nextProcessEvent = reinterpret_cast<ProcessEventFn>(original[kProcessEventIndex]);
-    clone[kProcessEventIndex] = reinterpret_cast<void*>(&ProcessEventProxy);
+    void* trampoline = nullptr;
+    const MH_STATUS createStatus = MH_CreateHook(
+        target,
+        reinterpret_cast<void*>(&ProcessEventProxy),
+        &trampoline);
+    if (createStatus != MH_OK) {
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "MH_CreateHook(ProcessEvent) failed status=%s target=%p", MH_StatusToString(createStatus), target);
+        Log("ERROR", message);
+        return false;
+    }
 
-    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(objectVtablePointer), clone);
-    if (*objectVtablePointer != clone) {
-        Log("ERROR", "failed to assign cloned default-object vtable");
-        VirtualFree(clone, 0, MEM_RELEASE);
-        context.clonedVtable = nullptr;
-        context.nextProcessEvent = nullptr;
+    context.nextProcessEvent = reinterpret_cast<ProcessEventFn>(trampoline);
+    if (!context.nextProcessEvent) {
+        Log("ERROR", "MinHook returned a null ProcessEvent trampoline");
+        return false;
+    }
+
+    const MH_STATUS enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK) {
+        char message[256]{};
+        std::snprintf(message, sizeof(message), "MH_EnableHook(ProcessEvent) failed status=%s", MH_StatusToString(enableStatus));
+        Log("ERROR", message);
         return false;
     }
 
@@ -398,9 +403,10 @@ bool InstallVtableBridge() noexcept {
     std::snprintf(
         message,
         sizeof(message),
-        "installed per-object ProcessEvent bridge object=%p next=%p",
-        context.targetDefaultObject,
-        reinterpret_cast<void*>(context.nextProcessEvent));
+        "installed global ProcessEvent hook target=%p trampoline=%p filterFunction=%p",
+        target,
+        trampoline,
+        context.targetFunction);
     Log("INFO", message);
     return true;
 }
@@ -417,7 +423,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for native Falcon menu-selection event");
+    Log("INFO", "searching for SetActiveGameIndex before installing global ProcessEvent filter");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -425,7 +431,7 @@ bool Install(HMODULE module) noexcept {
     }
 
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
-        if (FindSetActiveGameIndex() && InstallVtableBridge()) {
+        if (FindSetActiveGameIndex() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed);
             return true;
         }
