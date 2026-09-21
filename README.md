@@ -12,7 +12,7 @@ The native menu hook is designed to match the supplied working reference recordi
 - Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
 - The embedded WAV is played at its original full level with no added fade or artificial delay.
 
-Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. The reliable signal is FalconGameplayStatics `GetGameIndex`: its returned value changes in exact lockstep with the highlighted trilogy tile. The first observed `GetGameIndex` result triggers the Reignited Trilogy title line; later changes map `0 = Spyro 1`, `1 = Spyro 2`, and `2 = Spyro 3`. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
+Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI now also uses the call cadence as a visibility gate. Sparse startup/profile/save-screen calls are ignored; sustained rapid polling marks the trilogy selector as visible. Entering that state announces the current game, later `0/1/2` changes announce Spyro 1/2/3, and losing the rapid polling for about 280 ms marks a return to the root menu and announces “Spyro Reignited Trilogy”. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
 
 ## Install
 
@@ -34,16 +34,18 @@ ready channels=2 rate=48000 bits=16 clips=4
 [MenuEvents] installed global ProcessEvent hook ...
 ```
 
-The first observed game index announces the trilogy title, then highlighted-tile changes announce the selected game:
+The log now reports menu-state transitions as well as selection changes:
 
 ```text
-[MenuEvents] GetGameIndex initial=0 -> trilogy title cue=0
-cue=0 started ...
-[MenuEvents] GetGameIndex selection 0 -> 2 -> cue=3
+[MenuEvents] selector entered gameIndex=2 -> cue=3
 cue=3 started ...
-[MenuEvents] GetGameIndex selection 2 -> 1 -> cue=2
+[MenuEvents] selector highlight 2 -> 1 -> cue=2
 cue=2 started ...
+[MenuEvents] selector exited -> root menu trilogy title cue=0
+cue=0 started ...
 ```
+
+During startup/profile/save loading, isolated `GetGameIndex` samples are intentionally suppressed until the menu state is known.
 
 ## Build
 
