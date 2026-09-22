@@ -9,8 +9,8 @@ using PlayCue = bool(__cdecl*)(int cue) noexcept;
 // 0 = not started, 1 = initializing, 2 = ready, 3 = fallback-only/failed.
 using GetState = int(__cdecl*)() noexcept;
 
-// 0 = not started, 1 = searching for SetActiveGameIndex,
-// 2 = native menu hook installed, 3 = hook failed.
+// 0 = not started, 1 = resolving/installing the native menu hook,
+// 2 = hook installed, 3 = hook failed.
 using GetHookState = int(__cdecl*)() noexcept;
 
 } // namespace menu_voice_api

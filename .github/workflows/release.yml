@@ -1,0 +1,86 @@
+name: Publish release
+
+on:
+  push:
+    branches:
+      - "release/v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Read and validate version
+        shell: pwsh
+        run: |
+          $branch = "${{ github.ref_name }}"
+          if (-not $branch.StartsWith("release/")) {
+            throw "Release workflow must run from a release/vX.Y.Z branch."
+          }
+
+          $tag = $branch.Substring("release/".Length)
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release branch must be named release/vX.Y.Z."
+          }
+
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $match = [regex]::Match($cmake, 'project\(SpyroMenuVoices VERSION (\d+\.\d+\.\d+)')
+          if (-not $match.Success) {
+            throw "Could not read the project version from CMakeLists.txt."
+          }
+
+          $projectTag = "v$($match.Groups[1].Value)"
+          if ($tag -ne $projectTag) {
+            throw "Release branch requests $tag but CMakeLists.txt contains $projectTag."
+          }
+
+          $notes = "docs/releases/$tag.md"
+          if (-not (Test-Path $notes)) {
+            throw "Missing release notes: $notes"
+          }
+
+          "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "RELEASE_NOTES=$notes" >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $file = "build/Release/SpyroMenuVoices.asi"
+          $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *SpyroMenuVoices.asi" | Set-Content -NoNewline "build/Release/SpyroMenuVoices.asi.sha256"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$env:RELEASE_TAG already exists; nothing to publish."
+            exit 0
+          }
+
+          $target = (git rev-parse HEAD).Trim()
+
+          gh release create $env:RELEASE_TAG `
+            "build/Release/SpyroMenuVoices.asi#SpyroMenuVoices.asi" `
+            "build/Release/SpyroMenuVoices.asi.sha256#SpyroMenuVoices.asi.sha256" `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $target `
+            --title "Spyro Menu Voices $env:RELEASE_TAG" `
+            --notes-file $env:RELEASE_NOTES
