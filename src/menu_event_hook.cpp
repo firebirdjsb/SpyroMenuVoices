@@ -193,6 +193,8 @@ void Log(const char* level, const char* message) noexcept {
     CloseHandle(file);
 }
 
+std::string ObjectName(void* object) noexcept;
+
 std::string Normalize(std::string_view value) {
     std::string normalized;
     normalized.reserve(value.size());
