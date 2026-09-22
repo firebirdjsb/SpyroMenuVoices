@@ -38,9 +38,6 @@ constexpr DWORD kSearchDelayMs = 250;
 constexpr ULONGLONG kSelectorRapidCallMaxGapMs = 120;
 constexpr int kSelectorEnterRapidSamples = 4;
 constexpr ULONGLONG kSelectorExitSilenceMs = 280;
-constexpr ULONGLONG kStartupSparseGapMs = 500;
-constexpr int kStartupRootCandidateSamples = 2;
-constexpr ULONGLONG kStartupRootDelayMs = 280;
 constexpr DWORD kMenuStateWatchdogSleepMs = 25;
 
 enum class HookState : int {
@@ -104,8 +101,6 @@ struct HookContext {
     std::atomic<int> latestGameIndex{-999};
     std::atomic<ULONGLONG> lastGetGameCallTick{0};
     std::atomic<int> rapidGetGameSamples{0};
-    std::atomic<int> startupSparseSamples{0};
-    std::atomic<ULONGLONG> startupRootCueDueTick{0};
     std::atomic<bool> selectorActive{false};
     std::atomic<bool> selectorEverActive{false};
     std::atomic<bool> watchdogStarted{false};
@@ -380,15 +375,34 @@ void PlaySelectorEntryCue(int gameIndex) noexcept {
     voice_audio::Play(cue);
 }
 
-void EnterSelectorIfReady(int currentGameIndex, int rapidSamples) noexcept {
+void EnterSelectorIfReady(
+    int oldGameIndex,
+    int currentGameIndex,
+    int activeGameIndex,
+    int rapidSamples) noexcept {
     auto& context = Context();
+
+    // The profile/save screen can poll GetGameIndex rapidly too. The reliable
+    // selector proof from runtime logs is that the highlighted GetGameIndex
+    // changes independently from GetActiveGameIndex.
     if (rapidSamples < kSelectorEnterRapidSamples) return;
+    if (oldGameIndex == currentGameIndex) return;
+    if (activeGameIndex < 0 || activeGameIndex > 2) return;
+    if (currentGameIndex == activeGameIndex) return;
 
     bool expected = false;
     if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
 
     context.selectorEverActive.store(true, std::memory_order_release);
-    context.startupRootCueDueTick.store(0, std::memory_order_release);
+
+    char proof[256]{};
+    std::snprintf(
+        proof,
+        sizeof(proof),
+        "selector proven by divergent highlight active=%d gameIndex=%d",
+        activeGameIndex,
+        currentGameIndex);
+    Log("INFO", proof);
     PlaySelectorEntryCue(currentGameIndex);
 }
 
@@ -417,30 +431,14 @@ void ObserveGetGameIndex(int value) noexcept {
         context.rapidGetGameSamples.store(1, std::memory_order_release);
     }
 
-    if (!context.selectorEverActive.load(std::memory_order_acquire)) {
-        if (previousCall == 0) {
-            context.startupSparseSamples.store(1, std::memory_order_release);
-            Log("INFO", "startup GetGameIndex sample observed; audio suppressed until menu state is known");
-        } else if (gap >= kStartupSparseGapMs) {
-            const int sparseSamples =
-                context.startupSparseSamples.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (sparseSamples >= kStartupRootCandidateSamples) {
-                context.startupRootCueDueTick.store(
-                    now + kStartupRootDelayMs,
-                    std::memory_order_release);
-                char message[224]{};
-                std::snprintf(
-                    message,
-                    sizeof(message),
-                    "startup/root candidate armed after sparse GetGameIndex gap=%llu ms",
-                    static_cast<unsigned long long>(gap));
-                Log("INFO", message);
-            }
-        }
+    if (!context.selectorEverActive.load(std::memory_order_acquire) && previousCall == 0) {
+        Log("INFO", "startup/profile GetGameIndex observed; all audio suppressed until selector is proven");
     }
 
     if (!context.selectorActive.load(std::memory_order_acquire)) {
-        EnterSelectorIfReady(value, rapidSamples);
+        const int activeGameIndex =
+            context.lastGetActiveGameIndex.load(std::memory_order_acquire);
+        EnterSelectorIfReady(oldValue, value, activeGameIndex, rapidSamples);
         return;
     }
 
@@ -477,21 +475,7 @@ DWORD WINAPI MenuStateWatchdog(void*) noexcept {
                 bool expected = true;
                 if (context.selectorActive.compare_exchange_strong(expected, false)) {
                     context.rapidGetGameSamples.store(0, std::memory_order_release);
-                    context.startupRootCueDueTick.store(0, std::memory_order_release);
                     Log("INFO", "selector exited -> root menu trilogy title cue=0");
-                    voice_audio::Play(0);
-                }
-            }
-        } else if (!context.selectorEverActive.load(std::memory_order_acquire)) {
-            const ULONGLONG due =
-                context.startupRootCueDueTick.load(std::memory_order_acquire);
-            if (due != 0 && now >= due) {
-                ULONGLONG expectedDue = due;
-                if (context.startupRootCueDueTick.compare_exchange_strong(
-                        expectedDue,
-                        0,
-                        std::memory_order_acq_rel)) {
-                    Log("INFO", "startup/profile stage ended -> root menu trilogy title cue=0");
                     voice_audio::Play(0);
                 }
             }
@@ -675,7 +659,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon GetGameIndex menu-selection signal with visibility gating");
+    Log("INFO", "searching for Falcon GetGameIndex selector signal with active-game divergence gating");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
