@@ -386,7 +386,6 @@ void EnterSelectorIfReady(
 
     const bool activeIsValid = activeGameIndex >= 0 && activeGameIndex <= 2;
     const bool divergentChange =
-        rapidSamples >= 2 &&
         oldGameIndex != currentGameIndex &&
         activeIsValid &&
         currentGameIndex != activeGameIndex;
@@ -449,6 +448,20 @@ void ObserveGetGameIndex(int value) noexcept {
     if (!context.selectorActive.load(std::memory_order_acquire)) {
         const int activeGameIndex =
             context.lastGetActiveGameIndex.load(std::memory_order_acquire);
+
+        if (oldValue != value) {
+            char message[256]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "inactive GetGameIndex changed %d -> %d active=%d rapidSamples=%d",
+                oldValue,
+                value,
+                activeGameIndex,
+                rapidSamples);
+            Log("INFO", message);
+        }
+
         EnterSelectorIfReady(oldValue, value, activeGameIndex, rapidSamples);
         return;
     }
