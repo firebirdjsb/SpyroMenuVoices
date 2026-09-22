@@ -12,7 +12,7 @@ The native menu hook is designed to match the supplied working reference recordi
 - Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
 - The embedded WAV is played at its original full level with no added fade or artificial delay.
 
-Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI uses active-game divergence as the strongest selector signal, with rapid polling as a fallback for opening on the already-active game. Startup/profile/save-screen polling is always silent. The trilogy selector is considered real immediately when `GetGameIndex` changes to a value different from `GetActiveGameIndex`; unlike the earlier build, that proof no longer depends on timing. Once proven, later `0/1/2` changes announce Spyro 1/2/3. Selector state now stays latched; silence between highlight changes is no longer treated as leaving the selector. The trilogy-title cue is temporarily withheld until a real back/root-menu event is identified from the added lightweight menu-event diagnostics. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
+Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI uses active-game divergence as the strongest selector signal, with rapid polling as a fallback for opening on the already-active game. Startup/profile/save-screen polling is always silent. The trilogy selector is considered real immediately when `GetGameIndex` changes to a value different from `GetActiveGameIndex`; unlike the earlier build, that proof no longer depends on timing. Once proven, later `0/1/2` changes announce Spyro 1/2/3. Selector state stays latched; silence between highlight changes is never treated as leaving the selector. Runtime tracing identified the real root-menu signal as `UserWidget.OnAddedToFocusPath` on the `UI_Title_C_*` widget. The trilogy-title cue is now bound directly to that event instead of any timer or load callback. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
 
 ## Install
 
@@ -34,17 +34,21 @@ ready channels=2 rate=48000 bits=16 clips=4
 [MenuEvents] installed global ProcessEvent hook ...
 ```
 
-The log now reports menu-state transitions as well as selection changes:
+The log reports real menu-state transitions as well as selection changes:
 
 ```text
+[MenuEvents] tracking root-title focus function=OnAddedToFocusPath outer=UserWidget ...
+[MenuEvents] root title focused self=UI_Title_C_1 selectorWasActive=0 -> trilogy title cue=0
+cue=0 started ...
 [MenuEvents] selector entered gameIndex=2 -> cue=3
 cue=3 started ...
 [MenuEvents] selector highlight 2 -> 1 -> cue=2
 cue=2 started ...
-[MenuEvents] back/menu candidate fired function=... self=...
+[MenuEvents] root title focused self=UI_Title_C_1 selectorWasActive=1 -> trilogy title cue=0
+cue=0 started ...
 ```
 
-During startup/profile/save loading, all voice output is suppressed until the selector is positively proven. After that, the selector remains active across normal pauses between user inputs, so moving slowly between Spyro 1/2/3 cannot falsely trigger the trilogy-title line. Candidate back/menu/input events are logged so the real return-to-root transition can be bound without another timing heuristic. v0.5.4 expands that trace beyond the first 128 matches and only stores actual UFunction objects, covering Back/Cancel/Menu/Input/Pressed/Clicked/Navigation/Focus/Transition-style callbacks while the selector is active.
+During startup/profile/save loading, `GetGameIndex` polling remains silent. The trilogy-title line is driven only by the actual `UI_Title_C_*` widget gaining focus. Returning focus to the title after an unrelated popup is suppressed if the title cue was already announced for that visit. Entering the trilogy selector re-arms the title cue so backing out announces “Spyro Reignited Trilogy” exactly once.
 
 ## Build
 
