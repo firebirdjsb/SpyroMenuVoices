@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace menu_event_hook {
@@ -37,8 +38,6 @@ constexpr DWORD kSearchDelayMs = 250;
 // Sparse calls during profile/save loading are not treated as menu visibility.
 constexpr ULONGLONG kSelectorRapidCallMaxGapMs = 120;
 constexpr int kSelectorEnterRapidSamples = 4;
-constexpr ULONGLONG kSelectorExitSilenceMs = 280;
-constexpr DWORD kMenuStateWatchdogSleepMs = 25;
 
 enum class HookState : int {
     NotStarted = 0,
@@ -103,7 +102,7 @@ struct HookContext {
     std::atomic<int> rapidGetGameSamples{0};
     std::atomic<bool> selectorActive{false};
     std::atomic<bool> selectorEverActive{false};
-    std::atomic<bool> watchdogStarted{false};
+    std::unordered_map<void*, std::string> backTraceFunctions;
     std::wstring logPath;
     std::mutex logMutex;
     std::atomic<HookState> state{HookState::NotStarted};
@@ -200,6 +199,17 @@ std::string Normalize(std::string_view value) {
         if (std::isalnum(character)) normalized.push_back(static_cast<char>(std::tolower(character)));
     }
     return normalized;
+}
+
+bool IsBackTraceName(std::string_view normalized) noexcept {
+    return normalized.find("back") != std::string_view::npos ||
+           normalized.find("cancel") != std::string_view::npos ||
+           normalized.find("close") != std::string_view::npos ||
+           normalized.find("returntomenu") != std::string_view::npos ||
+           normalized.find("mainmenu") != std::string_view::npos ||
+           normalized.find("titlemenu") != std::string_view::npos ||
+           normalized.find("gameselect") != std::string_view::npos ||
+           normalized.find("selectgame") != std::string_view::npos;
 }
 
 bool AppendNameGuarded(AppendStringFn appendString, const FNameRaw* name, FStringRaw* output) noexcept {
@@ -309,6 +319,23 @@ bool FindGameIndexFunctions() noexcept {
             candidates.push_back(name);
         }
 
+        if (IsBackTraceName(normalized) && context.backTraceFunctions.size() < 128) {
+            std::string outerName = "<unknown>";
+            if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
+                void* outer = *reinterpret_cast<void**>(
+                    static_cast<std::uint8_t*>(object) + kUObjectOuterOffset);
+                if (outer) {
+                    const std::string resolvedOuter = ObjectName(outer);
+                    if (!resolvedOuter.empty()) outerName = resolvedOuter;
+                }
+            }
+
+            std::string qualified = outerName;
+            qualified += ".";
+            qualified += name;
+            context.backTraceFunctions.emplace(object, std::move(qualified));
+        }
+
         void** targetSlot = nullptr;
         if (normalized == "setactivegameindex") targetSlot = &context.targetSetActiveGameIndex;
         else if (normalized == "setgameindex") targetSlot = &context.targetSetGameIndex;
@@ -341,6 +368,13 @@ bool FindGameIndexFunctions() noexcept {
     }
 
     if (context.targetGetGameIndex) {
+        char message[192]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "armed %zu lightweight back/menu trace candidates",
+            context.backTraceFunctions.size());
+        Log("INFO", message);
         return true;
     }
 
@@ -481,59 +515,6 @@ void ObserveGetGameIndex(int value) noexcept {
     }
 }
 
-DWORD WINAPI MenuStateWatchdog(void*) noexcept {
-    auto& context = Context();
-
-    for (;;) {
-        if (context.state.load(std::memory_order_acquire) == HookState::Failed) {
-            return 0;
-        }
-
-        const ULONGLONG now = GetTickCount64();
-        const ULONGLONG lastCall =
-            context.lastGetGameCallTick.load(std::memory_order_acquire);
-
-        if (context.selectorActive.load(std::memory_order_acquire)) {
-            if (lastCall != 0 && now >= lastCall &&
-                now - lastCall >= kSelectorExitSilenceMs) {
-                bool expected = true;
-                if (context.selectorActive.compare_exchange_strong(expected, false)) {
-                    context.rapidGetGameSamples.store(0, std::memory_order_release);
-                    Log("INFO", "selector exited -> root menu trilogy title cue=0");
-                    voice_audio::Play(0);
-                }
-            }
-        }
-
-        Sleep(kMenuStateWatchdogSleepMs);
-    }
-}
-
-bool StartMenuStateWatchdog() noexcept {
-    auto& context = Context();
-    bool expected = false;
-    if (!context.watchdogStarted.compare_exchange_strong(expected, true)) {
-        return true;
-    }
-
-    HANDLE thread = CreateThread(
-        nullptr,
-        0,
-        &MenuStateWatchdog,
-        nullptr,
-        0,
-        nullptr);
-    if (!thread) {
-        context.watchdogStarted.store(false, std::memory_order_release);
-        Log("ERROR", "failed to create menu-state watchdog thread");
-        return false;
-    }
-
-    CloseHandle(thread);
-    Log("INFO", "menu-state watchdog started");
-    return true;
-}
-
 void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) noexcept {
     auto& context = Context();
     const ProcessEventFn next = context.nextProcessEvent;
@@ -543,6 +524,21 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const bool isSetGame = function == context.targetSetGameIndex;
     const bool isGetActive = function == context.targetGetActiveGameIndex;
     const bool isGetGame = function == context.targetGetGameIndex;
+
+    if (context.selectorActive.load(std::memory_order_acquire)) {
+        const auto trace = context.backTraceFunctions.find(function);
+        if (trace != context.backTraceFunctions.end()) {
+            const std::string selfName = ObjectName(self);
+            char message[768]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "back/menu candidate fired function=%s self=%s",
+                trace->second.c_str(),
+                selfName.empty() ? "<unknown>" : selfName.c_str());
+            Log("INFO", message);
+        }
+    }
 
     if (isSetActive || isSetGame) {
         std::int32_t raw0 = -999;
@@ -683,7 +679,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon GetGameIndex selector signal with conservative save-screen suppression");
+    Log("INFO", "searching for Falcon GetGameIndex selector signal; selector exit timer disabled");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -693,10 +689,7 @@ bool Install(HMODULE module) noexcept {
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
         if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed, std::memory_order_release);
-            if (!StartMenuStateWatchdog()) {
-                context.state.store(HookState::Failed, std::memory_order_release);
-                return false;
-            }
+            Log("INFO", "selector state latches after proof; no silence-based exit timer is active");
             return true;
         }
         Sleep(kSearchDelayMs);
