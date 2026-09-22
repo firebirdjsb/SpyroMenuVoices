@@ -44,7 +44,7 @@ cue=2 started ...
 [MenuEvents] back/menu candidate fired function=... self=...
 ```
 
-During startup/profile/save loading, all voice output is suppressed until the selector is positively proven. After that, the selector remains active across normal pauses between user inputs, so moving slowly between Spyro 1/2/3 cannot falsely trigger the trilogy-title line. Candidate back/menu events are logged so the real return-to-root transition can be bound without another timing heuristic.
+During startup/profile/save loading, all voice output is suppressed until the selector is positively proven. After that, the selector remains active across normal pauses between user inputs, so moving slowly between Spyro 1/2/3 cannot falsely trigger the trilogy-title line. Candidate back/menu/input events are logged so the real return-to-root transition can be bound without another timing heuristic. v0.5.4 expands that trace beyond the first 128 matches and only stores actual UFunction objects, covering Back/Cancel/Menu/Input/Pressed/Clicked/Navigation/Focus/Transition-style callbacks while the selector is active.
 
 ## Build
 
