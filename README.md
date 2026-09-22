@@ -12,7 +12,7 @@ The native menu hook is designed to match the supplied working reference recordi
 - Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
 - The embedded WAV is played at its original full level with no added fade or artificial delay.
 
-Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI now also uses the call cadence as a visibility gate. Sparse startup/profile/save-screen calls are ignored; sustained rapid polling marks the trilogy selector as visible. Entering that state announces the current game, later `0/1/2` changes announce Spyro 1/2/3, and losing the rapid polling for about 280 ms marks a return to the root menu and announces “Spyro Reignited Trilogy”. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
+Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI uses both call cadence and active-game divergence as a conservative visibility gate. Startup/profile/save-screen polling is always silent. The trilogy selector is only considered real after a rapid `GetGameIndex` change diverges from `GetActiveGameIndex`, which matches observed selector navigation but not profile loading. Once proven, later `0/1/2` changes announce Spyro 1/2/3, and losing selector polling for about 280 ms marks a return to the root menu and announces “Spyro Reignited Trilogy” exactly once. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
 
 ## Install
 
@@ -45,7 +45,7 @@ cue=2 started ...
 cue=0 started ...
 ```
 
-During startup/profile/save loading, isolated `GetGameIndex` samples are intentionally suppressed until the menu state is known.
+During startup/profile/save loading, all voice output is suppressed until the selector is positively proven by a highlighted-game value that differs from the active loaded game. This hotfix intentionally favors silence over a false title cue before the first selector visit.
 
 ## Build
 
