@@ -26,6 +26,7 @@ constexpr std::uintptr_t kAppendStringOffset = 0x005E4C60;
 constexpr std::uintptr_t kProcessEventOffset = 0x007688B0;
 constexpr std::uint32_t kExpectedTimestamp = 1558415778;
 constexpr std::uint32_t kExpectedImageSize = 61046784;
+constexpr std::size_t kUObjectClassOffset = 0x10;
 constexpr std::size_t kUObjectNameOffset = 0x18;
 constexpr std::size_t kUObjectOuterOffset = 0x20;
 constexpr std::size_t kUClassDefaultObjectOffset = 0xF8;
@@ -205,11 +206,41 @@ bool IsBackTraceName(std::string_view normalized) noexcept {
     return normalized.find("back") != std::string_view::npos ||
            normalized.find("cancel") != std::string_view::npos ||
            normalized.find("close") != std::string_view::npos ||
-           normalized.find("returntomenu") != std::string_view::npos ||
+           normalized.find("return") != std::string_view::npos ||
            normalized.find("mainmenu") != std::string_view::npos ||
-           normalized.find("titlemenu") != std::string_view::npos ||
+           normalized.find("title") != std::string_view::npos ||
+           normalized.find("menu") != std::string_view::npos ||
            normalized.find("gameselect") != std::string_view::npos ||
-           normalized.find("selectgame") != std::string_view::npos;
+           normalized.find("selectgame") != std::string_view::npos ||
+           normalized.find("select") != std::string_view::npos ||
+           normalized.find("navigation") != std::string_view::npos ||
+           normalized.find("navigate") != std::string_view::npos ||
+           normalized.find("input") != std::string_view::npos ||
+           normalized.find("pressed") != std::string_view::npos ||
+           normalized.find("released") != std::string_view::npos ||
+           normalized.find("clicked") != std::string_view::npos ||
+           normalized.find("button") != std::string_view::npos ||
+           normalized.find("focus") != std::string_view::npos ||
+           normalized.find("activate") != std::string_view::npos ||
+           normalized.find("deactivate") != std::string_view::npos ||
+           normalized.find("transition") != std::string_view::npos ||
+           normalized.find("construct") != std::string_view::npos ||
+           normalized.find("destruct") != std::string_view::npos ||
+           normalized.find("removefromparent") != std::string_view::npos ||
+           normalized.find("facebutton") != std::string_view::npos ||
+           normalized.find("escape") != std::string_view::npos;
+}
+
+bool IsUFunctionObject(void* object) noexcept {
+    if (!IsReadable(object, kUObjectClassOffset + sizeof(void*))) return false;
+    void* objectClass = *reinterpret_cast<void**>(
+        static_cast<std::uint8_t*>(object) + kUObjectClassOffset);
+    if (!objectClass) return false;
+
+    const std::string className = ObjectName(objectClass);
+    if (className.empty()) return false;
+    const std::string normalizedClass = Normalize(className);
+    return normalizedClass == "function" || normalizedClass == "blueprintgeneratedfunction";
 }
 
 bool AppendNameGuarded(AppendStringFn appendString, const FNameRaw* name, FStringRaw* output) noexcept {
@@ -319,7 +350,7 @@ bool FindGameIndexFunctions() noexcept {
             candidates.push_back(name);
         }
 
-        if (IsBackTraceName(normalized) && context.backTraceFunctions.size() < 128) {
+        if (IsBackTraceName(normalized) && IsUFunctionObject(object)) {
             std::string outerName = "<unknown>";
             if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
                 void* outer = *reinterpret_cast<void**>(
@@ -372,7 +403,7 @@ bool FindGameIndexFunctions() noexcept {
         std::snprintf(
             message,
             sizeof(message),
-            "armed %zu lightweight back/menu trace candidates",
+            "armed %zu expanded UFunction back/menu/input trace candidates",
             context.backTraceFunctions.size());
         Log("INFO", message);
         return true;
