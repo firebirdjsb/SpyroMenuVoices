@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(SpyroMenuVoices VERSION 0.5.4 LANGUAGES CXX RC)
+project(SpyroMenuVoices VERSION 0.6.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "SpyroMenuVoices requires Windows x64 and MSVC.")
