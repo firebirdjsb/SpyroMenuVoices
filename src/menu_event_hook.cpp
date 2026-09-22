@@ -15,7 +15,6 @@
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace menu_event_hook {
@@ -26,7 +25,6 @@ constexpr std::uintptr_t kAppendStringOffset = 0x005E4C60;
 constexpr std::uintptr_t kProcessEventOffset = 0x007688B0;
 constexpr std::uint32_t kExpectedTimestamp = 1558415778;
 constexpr std::uint32_t kExpectedImageSize = 61046784;
-constexpr std::size_t kUObjectClassOffset = 0x10;
 constexpr std::size_t kUObjectNameOffset = 0x18;
 constexpr std::size_t kUObjectOuterOffset = 0x20;
 constexpr std::size_t kUClassDefaultObjectOffset = 0xF8;
@@ -95,6 +93,7 @@ struct HookContext {
     void* targetSetGameIndex{};
     void* targetGetActiveGameIndex{};
     void* targetGetGameIndex{};
+    void* targetOnAddedToFocusPath{};
     ProcessEventFn nextProcessEvent{};
     std::atomic<int> lastGetActiveGameIndex{-999};
     std::atomic<int> lastGetGameIndex{-999};
@@ -103,7 +102,7 @@ struct HookContext {
     std::atomic<int> rapidGetGameSamples{0};
     std::atomic<bool> selectorActive{false};
     std::atomic<bool> selectorEverActive{false};
-    std::unordered_map<void*, std::string> backTraceFunctions;
+    std::atomic<bool> titleAnnounced{false};
     std::wstring logPath;
     std::mutex logMutex;
     std::atomic<HookState> state{HookState::NotStarted};
@@ -202,47 +201,6 @@ std::string Normalize(std::string_view value) {
         if (std::isalnum(character)) normalized.push_back(static_cast<char>(std::tolower(character)));
     }
     return normalized;
-}
-
-bool IsBackTraceName(std::string_view normalized) noexcept {
-    return normalized.find("back") != std::string_view::npos ||
-           normalized.find("cancel") != std::string_view::npos ||
-           normalized.find("close") != std::string_view::npos ||
-           normalized.find("return") != std::string_view::npos ||
-           normalized.find("mainmenu") != std::string_view::npos ||
-           normalized.find("title") != std::string_view::npos ||
-           normalized.find("menu") != std::string_view::npos ||
-           normalized.find("gameselect") != std::string_view::npos ||
-           normalized.find("selectgame") != std::string_view::npos ||
-           normalized.find("select") != std::string_view::npos ||
-           normalized.find("navigation") != std::string_view::npos ||
-           normalized.find("navigate") != std::string_view::npos ||
-           normalized.find("input") != std::string_view::npos ||
-           normalized.find("pressed") != std::string_view::npos ||
-           normalized.find("released") != std::string_view::npos ||
-           normalized.find("clicked") != std::string_view::npos ||
-           normalized.find("button") != std::string_view::npos ||
-           normalized.find("focus") != std::string_view::npos ||
-           normalized.find("activate") != std::string_view::npos ||
-           normalized.find("deactivate") != std::string_view::npos ||
-           normalized.find("transition") != std::string_view::npos ||
-           normalized.find("construct") != std::string_view::npos ||
-           normalized.find("destruct") != std::string_view::npos ||
-           normalized.find("removefromparent") != std::string_view::npos ||
-           normalized.find("facebutton") != std::string_view::npos ||
-           normalized.find("escape") != std::string_view::npos;
-}
-
-bool IsUFunctionObject(void* object) noexcept {
-    if (!IsReadable(object, kUObjectClassOffset + sizeof(void*))) return false;
-    void* objectClass = *reinterpret_cast<void**>(
-        static_cast<std::uint8_t*>(object) + kUObjectClassOffset);
-    if (!objectClass) return false;
-
-    const std::string className = ObjectName(objectClass);
-    if (className.empty()) return false;
-    const std::string normalizedClass = Normalize(className);
-    return normalizedClass == "function" || normalizedClass == "blueprintgeneratedfunction";
 }
 
 bool AppendNameGuarded(AppendStringFn appendString, const FNameRaw* name, FStringRaw* output) noexcept {
@@ -352,7 +310,9 @@ bool FindGameIndexFunctions() noexcept {
             candidates.push_back(name);
         }
 
-        if (IsBackTraceName(normalized) && IsUFunctionObject(object)) {
+        if (normalized == "onaddedtofocuspath" && !context.targetOnAddedToFocusPath) {
+            context.targetOnAddedToFocusPath = object;
+
             std::string outerName = "<unknown>";
             if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
                 void* outer = *reinterpret_cast<void**>(
@@ -363,10 +323,15 @@ bool FindGameIndexFunctions() noexcept {
                 }
             }
 
-            std::string qualified = outerName;
-            qualified += ".";
-            qualified += name;
-            context.backTraceFunctions.emplace(object, std::move(qualified));
+            char message[512]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "tracking root-title focus function=%s outer=%s function=%p",
+                name.c_str(),
+                outerName.c_str(),
+                object);
+            Log("INFO", message);
         }
 
         void** targetSlot = nullptr;
@@ -400,14 +365,7 @@ bool FindGameIndexFunctions() noexcept {
         Log("INFO", message);
     }
 
-    if (context.targetGetGameIndex) {
-        char message[192]{};
-        std::snprintf(
-            message,
-            sizeof(message),
-            "armed %zu expanded UFunction back/menu/input trace candidates",
-            context.backTraceFunctions.size());
-        Log("INFO", message);
+    if (context.targetGetGameIndex && context.targetOnAddedToFocusPath) {
         return true;
     }
 
@@ -469,6 +427,7 @@ void EnterSelectorIfReady(
     if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
 
     context.selectorEverActive.store(true, std::memory_order_release);
+    context.titleAnnounced.store(false, std::memory_order_release);
 
     char proof[320]{};
     std::snprintf(
@@ -557,20 +516,44 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const bool isSetGame = function == context.targetSetGameIndex;
     const bool isGetActive = function == context.targetGetActiveGameIndex;
     const bool isGetGame = function == context.targetGetGameIndex;
+    const bool isAddedToFocusPath = function == context.targetOnAddedToFocusPath;
 
-    if (context.selectorActive.load(std::memory_order_acquire)) {
-        const auto trace = context.backTraceFunctions.find(function);
-        if (trace != context.backTraceFunctions.end()) {
-            const std::string selfName = ObjectName(self);
-            char message[768]{};
+    if (isAddedToFocusPath) {
+        next(self, function, parameters);
+
+        const std::string selfName = ObjectName(self);
+        const std::string normalizedSelf = Normalize(selfName);
+        const bool isRootTitle =
+            normalizedSelf.rfind("uititlec", 0) == 0;
+
+        if (!isRootTitle) return;
+
+        const bool selectorWasActive =
+            context.selectorActive.exchange(false, std::memory_order_acq_rel);
+        const bool alreadyAnnounced =
+            context.titleAnnounced.exchange(true, std::memory_order_acq_rel);
+        context.rapidGetGameSamples.store(0, std::memory_order_release);
+
+        if (!alreadyAnnounced || selectorWasActive) {
+            char message[320]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "back/menu candidate fired function=%s self=%s",
-                trace->second.c_str(),
-                selfName.empty() ? "<unknown>" : selfName.c_str());
+                "root title focused self=%s selectorWasActive=%d -> trilogy title cue=0",
+                selfName.c_str(),
+                selectorWasActive ? 1 : 0);
+            Log("INFO", message);
+            voice_audio::Play(0);
+        } else {
+            char message[256]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "root title refocused self=%s (cue already announced; suppressed)",
+                selfName.c_str());
             Log("INFO", message);
         }
+        return;
     }
 
     if (isSetActive || isSetGame) {
@@ -689,13 +672,14 @@ bool InstallGlobalProcessEventHook() noexcept {
     std::snprintf(
         message,
         sizeof(message),
-        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p",
+        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p TitleFocus=%p",
         target,
         trampoline,
         context.targetSetGameIndex,
         context.targetSetActiveGameIndex,
         context.targetGetActiveGameIndex,
-        context.targetGetGameIndex);
+        context.targetGetGameIndex,
+        context.targetOnAddedToFocusPath);
     Log("INFO", message);
     return true;
 }
@@ -712,7 +696,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon GetGameIndex selector signal; selector exit timer disabled");
+    Log("INFO", "searching for selector signal and root UI_Title focus event");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -722,13 +706,13 @@ bool Install(HMODULE module) noexcept {
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
         if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed, std::memory_order_release);
-            Log("INFO", "selector state latches after proof; no silence-based exit timer is active");
+            Log("INFO", "menu voice state ready; title cue is bound to UI_Title focus, not timers");
             return true;
         }
         Sleep(kSearchDelayMs);
     }
 
-    Log("ERROR", "timed out locating GetGameIndex or hooking global ProcessEvent");
+    Log("ERROR", "timed out locating GetGameIndex/UI_Title focus signal or hooking global ProcessEvent");
     context.state.store(HookState::Failed);
     return false;
 }
