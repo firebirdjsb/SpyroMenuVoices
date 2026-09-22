@@ -382,26 +382,37 @@ void EnterSelectorIfReady(
     int rapidSamples) noexcept {
     auto& context = Context();
 
-    // The profile/save screen can poll GetGameIndex rapidly too. The reliable
-    // selector proof from runtime logs is that the highlighted GetGameIndex
-    // changes independently from GetActiveGameIndex.
-    if (rapidSamples < kSelectorEnterRapidSamples) return;
-    if (oldGameIndex == currentGameIndex) return;
-    if (activeGameIndex < 0 || activeGameIndex > 2) return;
-    if (currentGameIndex == activeGameIndex) return;
+    if (currentGameIndex < 0 || currentGameIndex > 2) return;
+
+    const bool activeIsValid = activeGameIndex >= 0 && activeGameIndex <= 2;
+    const bool divergentChange =
+        rapidSamples >= 2 &&
+        oldGameIndex != currentGameIndex &&
+        activeIsValid &&
+        currentGameIndex != activeGameIndex;
+
+    // The save/profile screen in the captured runtime log polls roughly every
+    // 0.6 seconds, so it can never build this rapid sample streak. The actual
+    // trilogy chooser polls continuously while visible.
+    const bool sustainedSelectorPolling =
+        rapidSamples >= kSelectorEnterRapidSamples;
+
+    if (!divergentChange && !sustainedSelectorPolling) return;
 
     bool expected = false;
     if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
 
     context.selectorEverActive.store(true, std::memory_order_release);
 
-    char proof[256]{};
+    char proof[320]{};
     std::snprintf(
         proof,
         sizeof(proof),
-        "selector proven by divergent highlight active=%d gameIndex=%d",
+        "selector proven method=%s active=%d gameIndex=%d rapidSamples=%d",
+        divergentChange ? "divergence" : "rapid-polling",
         activeGameIndex,
-        currentGameIndex);
+        currentGameIndex,
+        rapidSamples);
     Log("INFO", proof);
     PlaySelectorEntryCue(currentGameIndex);
 }
@@ -659,7 +670,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for Falcon GetGameIndex selector signal with active-game divergence gating");
+    Log("INFO", "searching for Falcon GetGameIndex selector signal with conservative save-screen suppression");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
