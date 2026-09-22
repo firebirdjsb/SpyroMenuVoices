@@ -12,7 +12,7 @@ The native menu hook is designed to match the supplied working reference recordi
 - Re-entering the same game button may replay its line; only duplicate event chatter within 150 ms is ignored.
 - The embedded WAV is played at its original full level with no added fade or artificial delay.
 
-Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI uses active-game divergence as the strongest selector signal, with rapid polling as a fallback for opening on the already-active game. Startup/profile/save-screen polling is always silent. The trilogy selector is considered real immediately when `GetGameIndex` changes to a value different from `GetActiveGameIndex`; unlike the earlier build, that proof no longer depends on timing. Once proven, later `0/1/2` changes announce Spyro 1/2/3, and losing selector polling for about 280 ms marks a return to the root menu and announces “Spyro Reignited Trilogy” exactly once. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
+Runtime tracing of the actual trilogy menu showed that `SetActiveGameIndex` and `SetGameIndex` do not drive hover/navigation. FalconGameplayStatics `GetGameIndex` does: its returned value changes in exact lockstep with the highlighted trilogy tile. The ASI uses active-game divergence as the strongest selector signal, with rapid polling as a fallback for opening on the already-active game. Startup/profile/save-screen polling is always silent. The trilogy selector is considered real immediately when `GetGameIndex` changes to a value different from `GetActiveGameIndex`; unlike the earlier build, that proof no longer depends on timing. Once proven, later `0/1/2` changes announce Spyro 1/2/3. Selector state now stays latched; silence between highlight changes is no longer treated as leaving the selector. The trilogy-title cue is temporarily withheld until a real back/root-menu event is identified from the added lightweight menu-event diagnostics. A validated global `ProcessEvent` hook filters only the Falcon game-index UFunctions, so there is no per-frame name lookup.
 
 ## Install
 
@@ -41,11 +41,10 @@ The log now reports menu-state transitions as well as selection changes:
 cue=3 started ...
 [MenuEvents] selector highlight 2 -> 1 -> cue=2
 cue=2 started ...
-[MenuEvents] selector exited -> root menu trilogy title cue=0
-cue=0 started ...
+[MenuEvents] back/menu candidate fired function=... self=...
 ```
 
-During startup/profile/save loading, all voice output is suppressed until the selector is positively proven by a highlighted-game value that differs from the active loaded game. This hotfix intentionally favors silence over a false title cue before the first selector visit.
+During startup/profile/save loading, all voice output is suppressed until the selector is positively proven. After that, the selector remains active across normal pauses between user inputs, so moving slowly between Spyro 1/2/3 cannot falsely trigger the trilogy-title line. Candidate back/menu events are logged so the real return-to-root transition can be bound without another timing heuristic.
 
 ## Build
 
