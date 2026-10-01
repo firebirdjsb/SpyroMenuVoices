@@ -33,11 +33,6 @@ constexpr std::size_t kVtableSlotsToClone = 128;
 constexpr int kSearchAttempts = 120;
 constexpr DWORD kSearchDelayMs = 250;
 
-// GetGameIndex is polled rapidly while the trilogy game chooser is actually visible.
-// Sparse calls during profile/save loading are not treated as menu visibility.
-constexpr ULONGLONG kSelectorRapidCallMaxGapMs = 120;
-constexpr int kSelectorEnterRapidSamples = 4;
-
 enum class HookState : int {
     NotStarted = 0,
     Searching = 1,
@@ -94,6 +89,7 @@ struct HookContext {
     void* targetGetActiveGameIndex{};
     void* targetGetGameIndex{};
     void* targetOnAddedToFocusPath{};
+    void* targetOnRemovedFromFocusPath{};
     ProcessEventFn nextProcessEvent{};
     std::atomic<int> lastGetActiveGameIndex{-999};
     std::atomic<int> lastGetGameIndex{-999};
@@ -102,6 +98,12 @@ struct HookContext {
     std::atomic<int> rapidGetGameSamples{0};
     std::atomic<bool> selectorActive{false};
     std::atomic<bool> selectorEverActive{false};
+    std::atomic<bool> selectorArmedByTitleFocusLoss{false};
+    std::atomic<bool> selectorUiActive{false};
+    std::atomic<bool> selectorEntryAllowed{false};
+    std::atomic<void*> selectorRootObject{nullptr};
+    std::atomic<bool> titleSeen{false};
+    std::atomic<bool> selectionActivitySinceTitle{false};
     std::atomic<bool> titleAnnounced{false};
     std::wstring logPath;
     std::mutex logMutex;
@@ -310,8 +312,18 @@ bool FindGameIndexFunctions() noexcept {
             candidates.push_back(name);
         }
 
-        if (normalized == "onaddedtofocuspath" && !context.targetOnAddedToFocusPath) {
-            context.targetOnAddedToFocusPath = object;
+        void** focusSlot = nullptr;
+        const char* focusLabel = nullptr;
+        if (normalized == "onaddedtofocuspath") {
+            focusSlot = &context.targetOnAddedToFocusPath;
+            focusLabel = "added";
+        } else if (normalized == "onremovedfromfocuspath") {
+            focusSlot = &context.targetOnRemovedFromFocusPath;
+            focusLabel = "removed";
+        }
+
+        if (focusSlot && !*focusSlot) {
+            *focusSlot = object;
 
             std::string outerName = "<unknown>";
             if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
@@ -327,7 +339,8 @@ bool FindGameIndexFunctions() noexcept {
             std::snprintf(
                 message,
                 sizeof(message),
-                "tracking root-title focus function=%s outer=%s function=%p",
+                "tracking root-title focus-%s function=%s outer=%s function=%p",
+                focusLabel,
                 name.c_str(),
                 outerName.c_str(),
                 object);
@@ -365,7 +378,9 @@ bool FindGameIndexFunctions() noexcept {
         Log("INFO", message);
     }
 
-    if (context.targetGetGameIndex && context.targetOnAddedToFocusPath) {
+    if (context.targetGetGameIndex &&
+        context.targetOnAddedToFocusPath &&
+        context.targetOnRemovedFromFocusPath) {
         return true;
     }
 
@@ -386,124 +401,54 @@ int CueForGameIndex(std::int32_t index) noexcept {
     return 0;
 }
 
-void PlaySelectorEntryCue(int gameIndex) noexcept {
-    if (gameIndex < 0 || gameIndex > 2) return;
-    const int cue = CueForGameIndex(gameIndex);
-    char message[224]{};
-    std::snprintf(
-        message,
-        sizeof(message),
-        "selector entered gameIndex=%d -> cue=%d",
-        gameIndex,
-        cue);
-    Log("INFO", message);
-    voice_audio::Play(cue);
+int GameIndexFromSelectorFocusName(std::string_view name) noexcept {
+    // Runtime tracing shows the trilogy tiles themselves are named 001/002/003.
+    // They map directly to Spyro 1/2/3.
+    if (name == "001") return 0;
+    if (name == "002") return 1;
+    if (name == "003") return 2;
+    return -1;
 }
 
-void EnterSelectorIfReady(
-    int oldGameIndex,
-    int currentGameIndex,
-    int activeGameIndex,
-    int rapidSamples) noexcept {
-    auto& context = Context();
+bool IsSelectorRootName(std::string_view normalizedName) noexcept {
+    return normalizedName.rfind("uimainc", 0) == 0;
+}
 
-    if (currentGameIndex < 0 || currentGameIndex > 2) return;
+bool IsInsideSelectorRoot(void* object, void* expectedRoot) noexcept {
+    // Hard context gate: numbered widgets are valid only when their UObject
+    // outer chain reaches the exact UI_Main_C_* instance that opened the
+    // trilogy selector. Reused 001/002/003 names elsewhere can never qualify.
+    if (!object || !expectedRoot) return false;
 
-    const bool activeIsValid = activeGameIndex >= 0 && activeGameIndex <= 2;
-    const bool divergentChange =
-        oldGameIndex != currentGameIndex &&
-        activeIsValid &&
-        currentGameIndex != activeGameIndex;
+    void* current = object;
+    for (int depth = 0; depth < 12 && current; ++depth) {
+        if (!IsReadable(current, kUObjectOuterOffset + sizeof(void*))) return false;
 
-    // The save/profile screen in the captured runtime log polls roughly every
-    // 0.6 seconds, so it can never build this rapid sample streak. The actual
-    // trilogy chooser polls continuously while visible.
-    const bool sustainedSelectorPolling =
-        rapidSamples >= kSelectorEnterRapidSamples;
+        void* outer = *reinterpret_cast<void**>(
+            static_cast<std::uint8_t*>(current) + kUObjectOuterOffset);
+        if (!outer) return false;
+        if (outer == expectedRoot) return true;
 
-    if (!divergentChange && !sustainedSelectorPolling) return;
-
-    bool expected = false;
-    if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
-
-    context.selectorEverActive.store(true, std::memory_order_release);
-    context.titleAnnounced.store(false, std::memory_order_release);
-
-    char proof[320]{};
-    std::snprintf(
-        proof,
-        sizeof(proof),
-        "selector proven method=%s active=%d gameIndex=%d rapidSamples=%d",
-        divergentChange ? "divergence" : "rapid-polling",
-        activeGameIndex,
-        currentGameIndex,
-        rapidSamples);
-    Log("INFO", proof);
-    PlaySelectorEntryCue(currentGameIndex);
+        current = outer;
+    }
+    return false;
 }
 
 void ObserveGetGameIndex(int value) noexcept {
     auto& context = Context();
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG previousCall =
-        context.lastGetGameCallTick.exchange(now, std::memory_order_acq_rel);
-
     context.latestGameIndex.store(value, std::memory_order_release);
     const int oldValue =
         context.lastGetGameIndex.exchange(value, std::memory_order_acq_rel);
 
-    ULONGLONG gap = 0;
-    int rapidSamples = 1;
-
-    if (previousCall != 0 && now >= previousCall) {
-        gap = now - previousCall;
-        if (gap <= kSelectorRapidCallMaxGapMs) {
-            rapidSamples =
-                context.rapidGetGameSamples.fetch_add(1, std::memory_order_acq_rel) + 1;
-        } else {
-            context.rapidGetGameSamples.store(1, std::memory_order_release);
-        }
-    } else {
-        context.rapidGetGameSamples.store(1, std::memory_order_release);
-    }
-
-    if (!context.selectorEverActive.load(std::memory_order_acquire) && previousCall == 0) {
-        Log("INFO", "startup/profile GetGameIndex observed; all audio suppressed until selector is proven");
-    }
-
-    if (!context.selectorActive.load(std::memory_order_acquire)) {
-        const int activeGameIndex =
-            context.lastGetActiveGameIndex.load(std::memory_order_acquire);
-
-        if (oldValue != value) {
-            char message[256]{};
-            std::snprintf(
-                message,
-                sizeof(message),
-                "inactive GetGameIndex changed %d -> %d active=%d rapidSamples=%d",
-                oldValue,
-                value,
-                activeGameIndex,
-                rapidSamples);
-            Log("INFO", message);
-        }
-
-        EnterSelectorIfReady(oldValue, value, activeGameIndex, rapidSamples);
-        return;
-    }
-
-    if (oldValue != value && value >= 0 && value <= 2) {
-        const int cue = CueForGameIndex(value);
-        char message[224]{};
+    if (oldValue != value) {
+        char message[256]{};
         std::snprintf(
             message,
             sizeof(message),
-            "selector highlight %d -> %d -> cue=%d",
+            "GetGameIndex changed %d -> %d (diagnostic only; audio hard-blocked)",
             oldValue,
-            value,
-            cue);
+            value);
         Log("INFO", message);
-        voice_audio::Play(cue);
     }
 }
 
@@ -517,6 +462,12 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const bool isGetActive = function == context.targetGetActiveGameIndex;
     const bool isGetGame = function == context.targetGetGameIndex;
     const bool isAddedToFocusPath = function == context.targetOnAddedToFocusPath;
+    const bool isRemovedFromFocusPath = function == context.targetOnRemovedFromFocusPath;
+
+    if (isRemovedFromFocusPath) {
+        next(self, function, parameters);
+        return;
+    }
 
     if (isAddedToFocusPath) {
         next(self, function, parameters);
@@ -526,33 +477,146 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         const bool isRootTitle =
             normalizedSelf.rfind("uititlec", 0) == 0;
 
-        if (!isRootTitle) return;
+        if (isRootTitle) {
+            context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
+            context.selectorUiActive.store(false, std::memory_order_release);
+            context.selectorRootObject.store(nullptr, std::memory_order_release);
+            context.selectorEntryAllowed.store(true, std::memory_order_release);
+            context.titleSeen.store(true, std::memory_order_release);
 
-        const bool selectorWasActive =
-            context.selectorActive.exchange(false, std::memory_order_acq_rel);
-        const bool alreadyAnnounced =
-            context.titleAnnounced.exchange(true, std::memory_order_acq_rel);
-        context.rapidGetGameSamples.store(0, std::memory_order_release);
+            const bool selectorWasActive =
+                context.selectorActive.exchange(false, std::memory_order_acq_rel);
+            const bool hadSelectionActivity =
+                context.selectionActivitySinceTitle.exchange(false, std::memory_order_acq_rel);
+            const bool alreadyAnnounced =
+                context.titleAnnounced.exchange(true, std::memory_order_acq_rel);
+            context.rapidGetGameSamples.store(0, std::memory_order_release);
 
-        if (!alreadyAnnounced || selectorWasActive) {
-            char message[320]{};
+            if (!alreadyAnnounced || selectorWasActive || hadSelectionActivity) {
+                char message[384]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "root title focused self=%s selectorWasActive=%d selectionActivity=%d -> trilogy title cue=0",
+                    selfName.c_str(),
+                    selectorWasActive ? 1 : 0,
+                    hadSelectionActivity ? 1 : 0);
+                Log("INFO", message);
+                voice_audio::Play(0);
+            } else {
+                char message[256]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "root title refocused self=%s (cue already announced; suppressed)",
+                    selfName.c_str());
+                Log("INFO", message);
+            }
+            return;
+        }
+
+        if (!context.titleSeen.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        if (IsSelectorRootName(normalizedSelf)) {
+            const bool entryAllowed =
+                context.selectorEntryAllowed.exchange(false, std::memory_order_acq_rel);
+
+            if (!entryAllowed) {
+                char message[320]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "UI_Main focus self=%s ignored; selector entry permission is CLOSED",
+                    selfName.c_str());
+                Log("INFO", message);
+                return;
+            }
+
+            context.selectorRootObject.store(self, std::memory_order_release);
+            context.selectorUiActive.store(true, std::memory_order_release);
+            context.selectorActive.store(true, std::memory_order_release);
+            context.selectorEverActive.store(true, std::memory_order_release);
+            context.selectionActivitySinceTitle.store(true, std::memory_order_release);
+            context.titleAnnounced.store(false, std::memory_order_release);
+            context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
+
+            char message[384]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "root title focused self=%s selectorWasActive=%d -> trilogy title cue=0",
+                "trilogy selector root focused self=%s root=%p -> selector hard gate OPEN",
                 selfName.c_str(),
-                selectorWasActive ? 1 : 0);
+                self);
             Log("INFO", message);
-            voice_audio::Play(0);
-        } else {
-            char message[256]{};
+            return;
+        }
+
+        const int gameIndex = GameIndexFromSelectorFocusName(selfName);
+        if (gameIndex >= 0) {
+            const bool gateOpen =
+                context.selectorUiActive.load(std::memory_order_acquire);
+            void* expectedRoot =
+                context.selectorRootObject.load(std::memory_order_acquire);
+            const bool insideSelector =
+                gateOpen && IsInsideSelectorRoot(self, expectedRoot);
+
+            if (insideSelector) {
+                context.selectionActivitySinceTitle.store(true, std::memory_order_release);
+                context.latestGameIndex.store(gameIndex, std::memory_order_release);
+                context.lastGetGameIndex.store(gameIndex, std::memory_order_release);
+
+                const int cue = CueForGameIndex(gameIndex);
+                char message[448]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "selector tile focused self=%s gameIndex=%d root=%p exactRootMatch=1 -> cue=%d",
+                    selfName.c_str(),
+                    gameIndex,
+                    expectedRoot,
+                    cue);
+                Log("INFO", message);
+                voice_audio::Play(cue);
+            } else {
+                if (gateOpen) {
+                    context.selectorUiActive.store(false, std::memory_order_release);
+                    context.selectorActive.store(false, std::memory_order_release);
+                    context.selectorRootObject.store(nullptr, std::memory_order_release);
+                }
+
+                char message[448]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "numbered focus self=%s gameIndex=%d HARD BLOCK gateOpen=%d exactRootMatch=%d",
+                    selfName.c_str(),
+                    gameIndex,
+                    gateOpen ? 1 : 0,
+                    insideSelector ? 1 : 0);
+                Log("INFO", message);
+            }
+            return;
+        }
+
+        // Any other focus target means we have left the exact trilogy-selector
+        // focus path. Close the gate immediately so later numbered widgets in
+        // save screens, gameplay, pause menus, guidebooks, options, etc. cannot
+        // inherit selector state.
+        if (context.selectorUiActive.exchange(false, std::memory_order_acq_rel)) {
+            context.selectorActive.store(false, std::memory_order_release);
+            context.selectorRootObject.store(nullptr, std::memory_order_release);
+
+            char message[384]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "root title refocused self=%s (cue already announced; suppressed)",
+                "selector hard gate CLOSED by non-selector focus self=%s",
                 selfName.c_str());
             Log("INFO", message);
         }
+
         return;
     }
 
@@ -607,11 +671,11 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         if (isGetActive) {
             const int old = context.lastGetActiveGameIndex.exchange(value, std::memory_order_relaxed);
             if (old != value) {
-                char message[192]{};
+                char message[256]{};
                 std::snprintf(
                     message,
                     sizeof(message),
-                    "GetActiveGameIndex changed %d -> %d",
+                    "GetActiveGameIndex changed %d -> %d (diagnostic only)",
                     old,
                     value);
                 Log("INFO", message);
@@ -672,14 +736,15 @@ bool InstallGlobalProcessEventHook() noexcept {
     std::snprintf(
         message,
         sizeof(message),
-        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p TitleFocus=%p",
+        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p TitleFocusAdd=%p TitleFocusRemove=%p",
         target,
         trampoline,
         context.targetSetGameIndex,
         context.targetSetActiveGameIndex,
         context.targetGetActiveGameIndex,
         context.targetGetGameIndex,
-        context.targetOnAddedToFocusPath);
+        context.targetOnAddedToFocusPath,
+        context.targetOnRemovedFromFocusPath);
     Log("INFO", message);
     return true;
 }
@@ -696,7 +761,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for selector signal and root UI_Title focus event");
+    Log("INFO", "searching for selector signal and root UI_Title focus events");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -706,13 +771,13 @@ bool Install(HMODULE module) noexcept {
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
         if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed, std::memory_order_release);
-            Log("INFO", "menu voice state ready; title cue is bound to UI_Title focus, not timers");
+            Log("INFO", "menu voice state ready; audio hard-blocked to UI_Title and UI_Main-owned 001/002/003 tiles");
             return true;
         }
         Sleep(kSearchDelayMs);
     }
 
-    Log("ERROR", "timed out locating GetGameIndex/UI_Title focus signal or hooking global ProcessEvent");
+    Log("ERROR", "timed out locating GetGameIndex/UI_Title focus signals or hooking global ProcessEvent");
     context.state.store(HookState::Failed);
     return false;
 }
