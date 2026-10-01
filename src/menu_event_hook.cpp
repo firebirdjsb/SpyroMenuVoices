@@ -100,6 +100,8 @@ struct HookContext {
     std::atomic<bool> selectorEverActive{false};
     std::atomic<bool> selectorArmedByTitleFocusLoss{false};
     std::atomic<bool> selectorUiActive{false};
+    std::atomic<bool> selectorEntryAllowed{false};
+    std::atomic<void*> selectorRootObject{nullptr};
     std::atomic<bool> titleSeen{false};
     std::atomic<bool> selectionActivitySinceTitle{false};
     std::atomic<bool> titleAnnounced{false};
@@ -412,10 +414,12 @@ bool IsSelectorRootName(std::string_view normalizedName) noexcept {
     return normalizedName.rfind("uimainc", 0) == 0;
 }
 
-bool IsInsideSelectorRoot(void* object) noexcept {
-    // Hard context gate: numbered widgets are only valid game tiles when their
-    // UObject outer chain belongs to UI_Main_C_*. Other menus can reuse names
-    // such as 001/002/003 and must never be allowed to trigger game voices.
+bool IsInsideSelectorRoot(void* object, void* expectedRoot) noexcept {
+    // Hard context gate: numbered widgets are valid only when their UObject
+    // outer chain reaches the exact UI_Main_C_* instance that opened the
+    // trilogy selector. Reused 001/002/003 names elsewhere can never qualify.
+    if (!object || !expectedRoot) return false;
+
     void* current = object;
     for (int depth = 0; depth < 12 && current; ++depth) {
         if (!IsReadable(current, kUObjectOuterOffset + sizeof(void*))) return false;
@@ -423,11 +427,8 @@ bool IsInsideSelectorRoot(void* object) noexcept {
         void* outer = *reinterpret_cast<void**>(
             static_cast<std::uint8_t*>(current) + kUObjectOuterOffset);
         if (!outer) return false;
+        if (outer == expectedRoot) return true;
 
-        const std::string outerName = ObjectName(outer);
-        if (!outerName.empty() && IsSelectorRootName(Normalize(outerName))) {
-            return true;
-        }
         current = outer;
     }
     return false;
@@ -479,6 +480,8 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         if (isRootTitle) {
             context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
             context.selectorUiActive.store(false, std::memory_order_release);
+            context.selectorRootObject.store(nullptr, std::memory_order_release);
+            context.selectorEntryAllowed.store(true, std::memory_order_release);
             context.titleSeen.store(true, std::memory_order_release);
 
             const bool selectorWasActive =
@@ -517,6 +520,21 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         }
 
         if (IsSelectorRootName(normalizedSelf)) {
+            const bool entryAllowed =
+                context.selectorEntryAllowed.exchange(false, std::memory_order_acq_rel);
+
+            if (!entryAllowed) {
+                char message[320]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "UI_Main focus self=%s ignored; selector entry permission is CLOSED",
+                    selfName.c_str());
+                Log("INFO", message);
+                return;
+            }
+
+            context.selectorRootObject.store(self, std::memory_order_release);
             context.selectorUiActive.store(true, std::memory_order_release);
             context.selectorActive.store(true, std::memory_order_release);
             context.selectorEverActive.store(true, std::memory_order_release);
@@ -524,12 +542,13 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
             context.titleAnnounced.store(false, std::memory_order_release);
             context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
 
-            char message[320]{};
+            char message[384]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "trilogy selector root focused self=%s -> selector hard gate OPEN",
-                selfName.c_str());
+                "trilogy selector root focused self=%s root=%p -> selector hard gate OPEN",
+                selfName.c_str(),
+                self);
             Log("INFO", message);
             return;
         }
@@ -538,8 +557,10 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         if (gameIndex >= 0) {
             const bool gateOpen =
                 context.selectorUiActive.load(std::memory_order_acquire);
+            void* expectedRoot =
+                context.selectorRootObject.load(std::memory_order_acquire);
             const bool insideSelector =
-                gateOpen && IsInsideSelectorRoot(self);
+                gateOpen && IsInsideSelectorRoot(self, expectedRoot);
 
             if (insideSelector) {
                 context.selectionActivitySinceTitle.store(true, std::memory_order_release);
@@ -547,22 +568,29 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
                 context.lastGetGameIndex.store(gameIndex, std::memory_order_release);
 
                 const int cue = CueForGameIndex(gameIndex);
-                char message[384]{};
+                char message[448]{};
                 std::snprintf(
                     message,
                     sizeof(message),
-                    "selector tile focused self=%s gameIndex=%d insideUI_Main=1 -> cue=%d",
+                    "selector tile focused self=%s gameIndex=%d root=%p exactRootMatch=1 -> cue=%d",
                     selfName.c_str(),
                     gameIndex,
+                    expectedRoot,
                     cue);
                 Log("INFO", message);
                 voice_audio::Play(cue);
             } else {
-                char message[384]{};
+                if (gateOpen) {
+                    context.selectorUiActive.store(false, std::memory_order_release);
+                    context.selectorActive.store(false, std::memory_order_release);
+                    context.selectorRootObject.store(nullptr, std::memory_order_release);
+                }
+
+                char message[448]{};
                 std::snprintf(
                     message,
                     sizeof(message),
-                    "numbered focus self=%s gameIndex=%d blocked gateOpen=%d insideUI_Main=%d",
+                    "numbered focus self=%s gameIndex=%d HARD BLOCK gateOpen=%d exactRootMatch=%d",
                     selfName.c_str(),
                     gameIndex,
                     gateOpen ? 1 : 0,
@@ -578,6 +606,7 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
         // inherit selector state.
         if (context.selectorUiActive.exchange(false, std::memory_order_acq_rel)) {
             context.selectorActive.store(false, std::memory_order_release);
+            context.selectorRootObject.store(nullptr, std::memory_order_release);
 
             char message[384]{};
             std::snprintf(
