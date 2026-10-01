@@ -94,6 +94,7 @@ struct HookContext {
     void* targetGetActiveGameIndex{};
     void* targetGetGameIndex{};
     void* targetOnAddedToFocusPath{};
+    void* targetOnRemovedFromFocusPath{};
     ProcessEventFn nextProcessEvent{};
     std::atomic<int> lastGetActiveGameIndex{-999};
     std::atomic<int> lastGetGameIndex{-999};
@@ -102,6 +103,7 @@ struct HookContext {
     std::atomic<int> rapidGetGameSamples{0};
     std::atomic<bool> selectorActive{false};
     std::atomic<bool> selectorEverActive{false};
+    std::atomic<bool> selectorArmedByTitleFocusLoss{false};
     std::atomic<bool> titleAnnounced{false};
     std::wstring logPath;
     std::mutex logMutex;
@@ -310,8 +312,18 @@ bool FindGameIndexFunctions() noexcept {
             candidates.push_back(name);
         }
 
-        if (normalized == "onaddedtofocuspath" && !context.targetOnAddedToFocusPath) {
-            context.targetOnAddedToFocusPath = object;
+        void** focusSlot = nullptr;
+        const char* focusLabel = nullptr;
+        if (normalized == "onaddedtofocuspath") {
+            focusSlot = &context.targetOnAddedToFocusPath;
+            focusLabel = "added";
+        } else if (normalized == "onremovedfromfocuspath") {
+            focusSlot = &context.targetOnRemovedFromFocusPath;
+            focusLabel = "removed";
+        }
+
+        if (focusSlot && !*focusSlot) {
+            *focusSlot = object;
 
             std::string outerName = "<unknown>";
             if (IsReadable(object, kUObjectOuterOffset + sizeof(void*))) {
@@ -327,7 +339,8 @@ bool FindGameIndexFunctions() noexcept {
             std::snprintf(
                 message,
                 sizeof(message),
-                "tracking root-title focus function=%s outer=%s function=%p",
+                "tracking root-title focus-%s function=%s outer=%s function=%p",
+                focusLabel,
                 name.c_str(),
                 outerName.c_str(),
                 object);
@@ -365,7 +378,9 @@ bool FindGameIndexFunctions() noexcept {
         Log("INFO", message);
     }
 
-    if (context.targetGetGameIndex && context.targetOnAddedToFocusPath) {
+    if (context.targetGetGameIndex &&
+        context.targetOnAddedToFocusPath &&
+        context.targetOnRemovedFromFocusPath) {
         return true;
     }
 
@@ -398,6 +413,28 @@ void PlaySelectorEntryCue(int gameIndex) noexcept {
         cue);
     Log("INFO", message);
     voice_audio::Play(cue);
+}
+
+void EnterSelectorFromTitleFocus(int currentGameIndex) noexcept {
+    auto& context = Context();
+    if (currentGameIndex < 0 || currentGameIndex > 2) return;
+
+    bool expected = false;
+    if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
+
+    context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
+    context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
+    context.selectorEverActive.store(true, std::memory_order_release);
+    context.titleAnnounced.store(false, std::memory_order_release);
+
+    char proof[256]{};
+    std::snprintf(
+        proof,
+        sizeof(proof),
+        "selector proven method=title-focus-loss gameIndex=%d",
+        currentGameIndex);
+    Log("INFO", proof);
+    PlaySelectorEntryCue(currentGameIndex);
 }
 
 void EnterSelectorIfReady(
@@ -472,6 +509,12 @@ void ObserveGetGameIndex(int value) noexcept {
     }
 
     if (!context.selectorActive.load(std::memory_order_acquire)) {
+        if (context.selectorArmedByTitleFocusLoss.load(std::memory_order_acquire) &&
+            value >= 0 && value <= 2) {
+            EnterSelectorFromTitleFocus(value);
+            return;
+        }
+
         const int activeGameIndex =
             context.lastGetActiveGameIndex.load(std::memory_order_acquire);
 
@@ -517,6 +560,30 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const bool isGetActive = function == context.targetGetActiveGameIndex;
     const bool isGetGame = function == context.targetGetGameIndex;
     const bool isAddedToFocusPath = function == context.targetOnAddedToFocusPath;
+    const bool isRemovedFromFocusPath = function == context.targetOnRemovedFromFocusPath;
+
+    if (isRemovedFromFocusPath) {
+        next(self, function, parameters);
+
+        const std::string selfName = ObjectName(self);
+        const std::string normalizedSelf = Normalize(selfName);
+        const bool isRootTitle =
+            normalizedSelf.rfind("uititlec", 0) == 0;
+
+        if (!isRootTitle) return;
+
+        context.selectorArmedByTitleFocusLoss.store(true, std::memory_order_release);
+        context.rapidGetGameSamples.store(0, std::memory_order_release);
+
+        char message[320]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "root title lost focus self=%s -> selector candidate armed",
+            selfName.c_str());
+        Log("INFO", message);
+        return;
+    }
 
     if (isAddedToFocusPath) {
         next(self, function, parameters);
@@ -528,6 +595,7 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
 
         if (!isRootTitle) return;
 
+        context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
         const bool selectorWasActive =
             context.selectorActive.exchange(false, std::memory_order_acq_rel);
         const bool alreadyAnnounced =
@@ -672,14 +740,15 @@ bool InstallGlobalProcessEventHook() noexcept {
     std::snprintf(
         message,
         sizeof(message),
-        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p TitleFocus=%p",
+        "installed global ProcessEvent hook target=%p trampoline=%p SetGameIndex=%p SetActiveGameIndex=%p GetActive=%p GetGame=%p TitleFocusAdd=%p TitleFocusRemove=%p",
         target,
         trampoline,
         context.targetSetGameIndex,
         context.targetSetActiveGameIndex,
         context.targetGetActiveGameIndex,
         context.targetGetGameIndex,
-        context.targetOnAddedToFocusPath);
+        context.targetOnAddedToFocusPath,
+        context.targetOnRemovedFromFocusPath);
     Log("INFO", message);
     return true;
 }
@@ -696,7 +765,7 @@ bool Install(HMODULE module) noexcept {
 
     context.module = module;
     SetLogPath(module);
-    Log("INFO", "searching for selector signal and root UI_Title focus event");
+    Log("INFO", "searching for selector signal and root UI_Title focus events");
 
     if (!ValidateExecutable()) {
         context.state.store(HookState::Failed);
@@ -712,7 +781,7 @@ bool Install(HMODULE module) noexcept {
         Sleep(kSearchDelayMs);
     }
 
-    Log("ERROR", "timed out locating GetGameIndex/UI_Title focus signal or hooking global ProcessEvent");
+    Log("ERROR", "timed out locating GetGameIndex/UI_Title focus signals or hooking global ProcessEvent");
     context.state.store(HookState::Failed);
     return false;
 }
