@@ -872,7 +872,7 @@ bool Install(HMODULE module) noexcept {
     for (int attempt = 0; attempt < kSearchAttempts; ++attempt) {
         if (FindGameIndexFunctions() && InstallGlobalProcessEventHook()) {
             context.state.store(HookState::Installed, std::memory_order_release);
-            Log("INFO", "menu voice state ready; UI_Main + 001/002/003 focus drives trilogy selector voices")
+            Log("INFO", "menu voice state ready; UI_Main + 001/002/003 focus drives trilogy selector voices");
             return true;
         }
         Sleep(kSearchDelayMs);
