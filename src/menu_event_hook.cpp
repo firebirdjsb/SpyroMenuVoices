@@ -562,25 +562,31 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
     const bool isRemovedFromFocusPath = function == context.targetOnRemovedFromFocusPath;
 
     if (isRemovedFromFocusPath) {
-        next(self, function, parameters);
-
         const std::string selfName = ObjectName(self);
         const std::string normalizedSelf = Normalize(selfName);
         const bool isRootTitle =
             normalizedSelf.rfind("uititlec", 0) == 0;
 
-        if (!isRootTitle) return;
+        const bool selectorAlreadyActive =
+            context.selectorActive.load(std::memory_order_acquire);
 
-        if (!context.selectorActive.load(std::memory_order_acquire)) {
+        // Arm before forwarding the focus-removal event. The widget handler can
+        // make nested ProcessEvent calls, including GetGameIndex, while it is
+        // transitioning into the trilogy selector.
+        if (isRootTitle && !selectorAlreadyActive) {
             context.selectorArmedByTitleFocusLoss.store(true, std::memory_order_release);
             context.rapidGetGameSamples.store(0, std::memory_order_release);
         }
+
+        next(self, function, parameters);
+
+        if (!isRootTitle) return;
 
         char message[320]{};
         std::snprintf(
             message,
             sizeof(message),
-            context.selectorActive.load(std::memory_order_acquire)
+            selectorAlreadyActive
                 ? "root title lost focus self=%s while selector already active"
                 : "root title lost focus self=%s -> selector candidate armed",
             selfName.c_str());
