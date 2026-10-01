@@ -423,7 +423,6 @@ void EnterSelectorFromTitleFocus(int currentGameIndex) noexcept {
     if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
 
     context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
-    context.selectorArmedByTitleFocusLoss.store(false, std::memory_order_release);
     context.selectorEverActive.store(true, std::memory_order_release);
     context.titleAnnounced.store(false, std::memory_order_release);
 
@@ -572,14 +571,18 @@ void __fastcall ProcessEventProxy(void* self, void* function, void* parameters) 
 
         if (!isRootTitle) return;
 
-        context.selectorArmedByTitleFocusLoss.store(true, std::memory_order_release);
-        context.rapidGetGameSamples.store(0, std::memory_order_release);
+        if (!context.selectorActive.load(std::memory_order_acquire)) {
+            context.selectorArmedByTitleFocusLoss.store(true, std::memory_order_release);
+            context.rapidGetGameSamples.store(0, std::memory_order_release);
+        }
 
         char message[320]{};
         std::snprintf(
             message,
             sizeof(message),
-            "root title lost focus self=%s -> selector candidate armed",
+            context.selectorActive.load(std::memory_order_acquire)
+                ? "root title lost focus self=%s while selector already active"
+                : "root title lost focus self=%s -> selector candidate armed",
             selfName.c_str());
         Log("INFO", message);
         return;
