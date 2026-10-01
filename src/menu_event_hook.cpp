@@ -466,6 +466,7 @@ void EnterSelectorIfReady(
     if (!context.selectorActive.compare_exchange_strong(expected, true)) return;
 
     context.selectorEverActive.store(true, std::memory_order_release);
+    context.selectionActivitySinceTitle.store(true, std::memory_order_release);
     context.titleAnnounced.store(false, std::memory_order_release);
 
     char proof[320]{};
@@ -507,7 +508,7 @@ void ObserveGetGameIndex(int value) noexcept {
     }
 
     if (!context.selectorEverActive.load(std::memory_order_acquire) && previousCall == 0) {
-        Log("INFO", "startup/profile GetGameIndex observed; all audio suppressed until selector is proven");
+        Log("INFO", "startup/profile GetGameIndex observed; all audio suppressed until real UI_Title is seen");
     }
 
     if (!context.selectorActive.load(std::memory_order_acquire)) {
